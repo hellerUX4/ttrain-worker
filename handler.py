@@ -23,6 +23,11 @@ import numpy as np
 FAKE = os.environ.get("TTRAIN_FAKE", "0") == "1"
 DIM = 384
 _MODEL = {}
+TIMM_MODELS = {
+    "dinov3_vits16": "vit_small_patch16_dinov3.lvd1689m",
+    "siglip2_vitb16": "vit_base_patch16_siglip_224.v2_webli",
+    "convnextv2_tiny": "convnextv2_tiny.fcmae_ft_in22k_in1k",
+}
 
 
 def _pil():
@@ -55,7 +60,11 @@ def load_model(name="dinov2_vits14"):
     if name in _MODEL:
         return _MODEL[name]
     import torch
-    model = torch.hub.load("facebookresearch/dinov2", name, trust_repo=True)
+    if name in TIMM_MODELS:
+        import timm
+        model = timm.create_model(f"hf-hub:timm/{TIMM_MODELS[name]}", pretrained=True, num_classes=0)
+    else:
+        model = torch.hub.load("facebookresearch/dinov2", name, trust_repo=True)
     model.eval()
     _MODEL[name] = model
     return model
@@ -92,6 +101,36 @@ def handle_embed(inp):
     return {"embeddings": embed_real(images, res, inp.get("model", "dinov2_vits14"))}
 
 
+def adapter_layers(model, model_name, blocks):
+    if model_name == "convnextv2_tiny":
+        return [(block.mlp, name)
+                for index, stage in enumerate(model.stages) if index in blocks
+                for block in stage.blocks for name in ("fc1", "fc2")]
+    if model_name in TIMM_MODELS:
+        return [(block.mlp, name)
+                for index, block in enumerate(model.blocks) if index in blocks
+                for name in ("fc1", "fc2")]
+    return [(block.attn, name)
+            for index, block in enumerate(model.blocks) if index in blocks
+            for name in ("qkv", "proj")]
+
+
+def image_transform(model, model_name, resolution):
+    from torchvision import transforms
+
+    if model_name in TIMM_MODELS:
+        from timm.data import create_transform, resolve_model_data_config
+        config = resolve_model_data_config(model)
+        config["input_size"] = (3, resolution, resolution)
+        return create_transform(**config, is_training=False)
+    return transforms.Compose([
+        transforms.Resize(resolution, interpolation=transforms.InterpolationMode.BICUBIC),
+        transforms.CenterCrop(resolution),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+    ])
+
+
 def handle_lora_predict(inp):
     images = inp["images"]
     buf = io.BytesIO(base64.b64decode(inp["adapter_b64"], validate=True))
@@ -102,21 +141,13 @@ def handle_lora_predict(inp):
         scores = (1 / (1 + np.exp(-np.clip(logits, -40, 40)))).tolist()
     else:
         import torch
-        from torchvision import transforms
 
         adapter = torch.load(buf, map_location="cpu", weights_only=True)
-        model = copy.deepcopy(load_model(adapter.get("model", "dinov2_vits14")))
-        layers = [getattr(block.attn, name)
-                  for index, block in enumerate(model.blocks) if index in adapter["blocks"]
-                  for name in ("qkv", "proj")]
+        model_name = adapter.get("model", "dinov2_vits14")
+        model = copy.deepcopy(load_model(model_name))
+        layers = [getattr(parent, name) for parent, name in adapter_layers(model, model_name, adapter["blocks"])]
         device = "cuda" if torch.cuda.is_available() else "cpu"
-        res = adapter["resolution"]
-        tf = transforms.Compose([
-            transforms.Resize(res, interpolation=transforms.InterpolationMode.BICUBIC),
-            transforms.CenterCrop(res),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
-        ])
+        tf = image_transform(model, model_name, adapter["resolution"])
         with torch.inference_mode():
             for layer, weights in zip(layers, adapter["lora"], strict=True):
                 delta = weights["B"] @ weights["A"]
@@ -164,7 +195,7 @@ def training_images(inp):
 def handle_lora(inp, progress=None):
     """Trainiert Low-Rank-Adapter auf den letzten Blöcken und liefert sie zurück."""
     images = training_images(inp)
-    blocks = inp.get("blocks") or [8, 9, 10, 11]
+    blocks = inp.get("blocks", [8, 9, 10, 11])
     res = int(inp.get("resolution", 336))
     epochs = int(inp.get("epochs", 8))
 
@@ -194,8 +225,10 @@ def handle_lora(inp, progress=None):
         return {"metrics": metrics, "adapter_b64": adapter, "blocks": blocks, "epochs": epochs}
 
     model = inp.get("model", "dinov2_vits14")
-    if model not in ("dinov2_vits14", "dinov2_vits14_reg", "dinov2_vitb14"):
+    if model not in (*TIMM_MODELS, "dinov2_vits14", "dinov2_vits14_reg", "dinov2_vitb14"):
         raise ValueError("Unbekanntes LoRA-Basismodell.")
+    if model in TIMM_MODELS and res != 224:
+        raise ValueError("Dieses Basismodell erwartet 224 Pixel.")
     return train_lora_real(images, blocks, res, epochs, float(inp.get("lr", 1e-4)), progress, model)
 
 
@@ -203,17 +236,13 @@ def train_lora_real(images, blocks, res, epochs, lr, progress=None, model_name="
     import torch
     import torch.nn as nn
     from torch.utils.data import DataLoader, Dataset
-    from torchvision import transforms
+    model = copy.deepcopy(load_model(model_name))
+    tf = image_transform(model, model_name, res)
 
     class DS(Dataset):
         def __init__(self, items):
             self.items = items
-            self.tf = transforms.Compose([
-                transforms.Resize(res, interpolation=transforms.InterpolationMode.BICUBIC),
-                transforms.CenterCrop(res),
-                transforms.ToTensor(),
-                transforms.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
-            ])
+            self.tf = tf
 
         def __len__(self):
             return len(self.items)
@@ -234,23 +263,20 @@ def train_lora_real(images, blocks, res, epochs, lr, progress=None, model_name="
         def forward(self, x):
             return self.base(x) + self.scale * (x @ self.A.T @ self.B.T)
 
-    model = copy.deepcopy(load_model(model_name))
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model.to(device)
     for p_ in model.parameters():
         p_.requires_grad_(False)
 
     wrapped = []
-    for idx, blk in enumerate(model.blocks):
-        if idx not in blocks:
-            continue
-        for name in ("qkv", "proj"):
-            layer = getattr(blk.attn, name)
-            lora = LoRA(layer).to(device)
-            setattr(blk.attn, name, lora)
-            wrapped.append(lora)
+    for parent, name in adapter_layers(model, model_name, blocks):
+        layer = getattr(parent, name)
+        lora = LoRA(layer).to(device)
+        setattr(parent, name, lora)
+        wrapped.append(lora)
 
-    head = nn.Linear(model.embed_dim, 1).to(device)
+    features = model.num_features if model_name in TIMM_MODELS else model.embed_dim
+    head = nn.Linear(features, 1).to(device)
     params = [head.weight, head.bias] + [p_ for m in wrapped for p_ in (m.A, m.B)]
     opt = torch.optim.AdamW(params, lr=lr)
     loss_fn = nn.BCEWithLogitsLoss()
