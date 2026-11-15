@@ -105,7 +105,7 @@ def handle_lora_predict(inp):
         from torchvision import transforms
 
         adapter = torch.load(buf, map_location="cpu", weights_only=True)
-        model = copy.deepcopy(load_model())
+        model = copy.deepcopy(load_model(adapter.get("model", "dinov2_vits14")))
         layers = [getattr(block.attn, name)
                   for index, block in enumerate(model.blocks) if index in adapter["blocks"]
                   for name in ("qkv", "proj")]
@@ -193,10 +193,13 @@ def handle_lora(inp, progress=None):
         adapter = base64.b64encode(buf.getvalue()).decode()
         return {"metrics": metrics, "adapter_b64": adapter, "blocks": blocks, "epochs": epochs}
 
-    return train_lora_real(images, blocks, res, epochs, float(inp.get("lr", 1e-4)), progress)
+    model = inp.get("model", "dinov2_vits14")
+    if model not in ("dinov2_vits14", "dinov2_vits14_reg", "dinov2_vitb14"):
+        raise ValueError("Unbekanntes LoRA-Basismodell.")
+    return train_lora_real(images, blocks, res, epochs, float(inp.get("lr", 1e-4)), progress, model)
 
 
-def train_lora_real(images, blocks, res, epochs, lr, progress=None):
+def train_lora_real(images, blocks, res, epochs, lr, progress=None, model_name="dinov2_vits14"):
     import torch
     import torch.nn as nn
     from torch.utils.data import DataLoader, Dataset
@@ -231,7 +234,7 @@ def train_lora_real(images, blocks, res, epochs, lr, progress=None):
         def forward(self, x):
             return self.base(x) + self.scale * (x @ self.A.T @ self.B.T)
 
-    model = copy.deepcopy(load_model())
+    model = copy.deepcopy(load_model(model_name))
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model.to(device)
     for p_ in model.parameters():
@@ -287,9 +290,9 @@ def train_lora_real(images, blocks, res, epochs, lr, progress=None):
 
     buf = io.BytesIO()
     torch.save({"lora": [{k: v.detach().cpu() for k, v in (("A", m.A), ("B", m.B))} for m in wrapped],
-                "head": head.state_dict(), "blocks": list(blocks), "resolution": res}, buf)
+                "head": head.state_dict(), "blocks": list(blocks), "resolution": res, "model": model_name}, buf)
     return {"metrics": metrics, "adapter_b64": base64.b64encode(buf.getvalue()).decode(),
-            "blocks": list(blocks), "epochs": epochs}
+            "blocks": list(blocks), "epochs": epochs, "model": model_name}
 
 
 def handler(job):
