@@ -309,7 +309,7 @@ def handle_lora(inp, progress=None):
         return {"metrics": metrics, "adapter_b64": adapter, "blocks": blocks, "epochs": epochs}
 
     model = inp.get("model", "dinov2_vits14")
-    if model not in (*TIMM_MODELS, "dinov2_vits14", "dinov2_vits14_reg", "dinov2_vitb14"):
+    if model not in (*TIMM_MODELS, "dinov2_vits14", "dinov2_vits14_reg", "dinov2_vitb14", "dinov2_vitl14_reg"):
         raise ValueError("Unbekanntes LoRA-Basismodell.")
     if model in TIMM_MODELS and res != 224:
         raise ValueError("Dieses Basismodell erwartet 224 Pixel.")
