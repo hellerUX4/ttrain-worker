@@ -16,6 +16,7 @@ import base64
 import copy
 import io
 import os
+import time
 
 import numpy as np
 
@@ -128,7 +129,7 @@ def handle_lora_predict(inp):
     return {"scores": {str(item["id"]): score for item, score in zip(images, scores)}}
 
 
-def handle_lora(inp):
+def handle_lora(inp, progress=None):
     """Trainiert Low-Rank-Adapter auf den letzten Blöcken und liefert sie zurück."""
     images = inp.get("images") or []
     blocks = inp.get("blocks") or [8, 9, 10, 11]
@@ -160,10 +161,10 @@ def handle_lora(inp):
         adapter = base64.b64encode(buf.getvalue()).decode()
         return {"metrics": metrics, "adapter_b64": adapter, "blocks": blocks, "epochs": epochs}
 
-    return train_lora_real(images, blocks, res, epochs, float(inp.get("lr", 1e-4)))
+    return train_lora_real(images, blocks, res, epochs, float(inp.get("lr", 1e-4)), progress)
 
 
-def train_lora_real(images, blocks, res, epochs, lr):
+def train_lora_real(images, blocks, res, epochs, lr, progress=None):
     import torch
     import torch.nn as nn
     from torch.utils.data import DataLoader, Dataset
@@ -222,7 +223,9 @@ def train_lora_real(images, blocks, res, epochs, lr):
     ds = DS(images)
     dl = DataLoader(ds, batch_size=8, shuffle=True)
     model.train()
-    for _ in range(epochs):
+    last_update = float("-inf")
+    for epoch in range(1, epochs + 1):
+        processed = 0
         for x, y in dl:
             x, y = x.to(device), y.float().to(device)
             opt.zero_grad()
@@ -230,6 +233,11 @@ def train_lora_real(images, blocks, res, epochs, lr):
             loss = loss_fn(head(feat).squeeze(1), y)
             loss.backward()
             opt.step()
+            processed += len(y)
+            now = time.monotonic()
+            if progress and (now - last_update >= 2 or (epoch == epochs and processed == len(ds))):
+                progress({"epoch": epoch, "epochs": epochs, "processed": processed, "images": len(ds)})
+                last_update = now
 
     model.eval()
     with torch.no_grad():
@@ -260,7 +268,11 @@ def handler(job):
     if task == "lora_predict":
         return handle_lora_predict(inp)
     if task == "lora_train":
-        return handle_lora(inp)
+        progress = None
+        if "id" in job and not FAKE:
+            from runpod.serverless import progress_update
+            progress = lambda update: progress_update(job, update)
+        return handle_lora(inp, progress)
     return {"error": f"unbekannte Aufgabe: {task}"}
 
 
