@@ -199,6 +199,15 @@ def handle_lora(inp, progress=None):
     res = int(inp.get("resolution", 336))
     epochs = int(inp.get("epochs", 8))
 
+    early = inp.get("task") == "lora_train_early"
+    validation = [item for item in images if item.get("validation")] if early else []
+    if early:
+        images = [item for item in images if not item.get("validation")]
+        if not images or {item["y"] for item in validation} != {0, 1}:
+            raise ValueError("Early Stopping braucht separate Ja- und Nein-Prüfbilder.")
+        if FAKE:
+            raise ValueError("Early Stopping benötigt einen echten Trainingsworker.")
+
     if FAKE:
         # Ersatz-Training: lineares Modell auf den Ersatzvektoren
         X = np.stack([fake_vector(_decode(i["b64"]), res) for i in images])
@@ -229,10 +238,10 @@ def handle_lora(inp, progress=None):
         raise ValueError("Unbekanntes LoRA-Basismodell.")
     if model in TIMM_MODELS and res != 224:
         raise ValueError("Dieses Basismodell erwartet 224 Pixel.")
-    return train_lora_real(images, blocks, res, epochs, float(inp.get("lr", 1e-4)), progress, model)
+    return train_lora_real(images, blocks, res, epochs, float(inp.get("lr", 1e-4)), progress, model, validation)
 
 
-def train_lora_real(images, blocks, res, epochs, lr, progress=None, model_name="dinov2_vits14"):
+def train_lora_real(images, blocks, res, epochs, lr, progress=None, model_name="dinov2_vits14", validation=()):
     import torch
     import torch.nn as nn
     from torch.utils.data import DataLoader, Dataset
@@ -283,9 +292,12 @@ def train_lora_real(images, blocks, res, epochs, lr, progress=None, model_name="
 
     ds = DS(images)
     dl = DataLoader(ds, batch_size=8, shuffle=True)
-    model.train()
+    validation_loader = DataLoader(DS(validation), batch_size=8) if validation else None
+    best_loss, best_epoch, best_params = float("inf"), 0, None
     last_update = float("-inf")
     for epoch in range(1, epochs + 1):
+        model.train()
+        head.train()
         processed = 0
         for x, y in dl:
             x, y = x.to(device), y.float().to(device)
@@ -296,10 +308,31 @@ def train_lora_real(images, blocks, res, epochs, lr, progress=None, model_name="
             opt.step()
             processed += len(y)
             now = time.monotonic()
-            if progress and (now - last_update >= 2 or (epoch == epochs and processed == len(ds))):
+            if progress and (now - last_update >= 2 or processed == len(ds)):
                 progress({"epoch": epoch, "epochs": epochs, "processed": processed, "images": len(ds)})
                 last_update = now
 
+        if validation_loader is not None:
+            model.eval()
+            head.eval()
+            total_loss = 0.0
+            with torch.no_grad():
+                for x, y in validation_loader:
+                    logits = head(model(x.to(device))).squeeze(1)
+                    total_loss += loss_fn(logits, y.to(device)).item() * len(y)
+            validation_loss = total_loss / len(validation)
+            if not np.isfinite(validation_loss):
+                raise RuntimeError("Der Validierungsverlust ist ungültig.")
+            if validation_loss < best_loss:
+                best_loss, best_epoch = validation_loss, epoch
+                best_params = [param.detach().cpu().clone() for param in params]
+            if epoch - best_epoch >= 3:
+                break
+
+    if best_params is not None:
+        with torch.no_grad():
+            for param, best in zip(params, best_params):
+                param.copy_(best)
     model.eval()
     with torch.no_grad():
         scores, labels = [], []
@@ -318,7 +351,8 @@ def train_lora_real(images, blocks, res, epochs, lr, progress=None, model_name="
     torch.save({"lora": [{k: v.detach().cpu() for k, v in (("A", m.A), ("B", m.B))} for m in wrapped],
                 "head": head.state_dict(), "blocks": list(blocks), "resolution": res, "model": model_name}, buf)
     return {"metrics": metrics, "adapter_b64": base64.b64encode(buf.getvalue()).decode(),
-            "blocks": list(blocks), "epochs": epochs, "model": model_name}
+            "blocks": list(blocks), "epochs": epoch, "best_epoch": best_epoch or epoch,
+            "early_stopping": validation_loader is not None, "model": model_name}
 
 
 def handler(job):
@@ -328,14 +362,14 @@ def handler(job):
         return handle_embed(inp)
     if task == "lora_predict":
         return handle_lora_predict(inp)
-    if task == "lora_train":
+    if task in ("lora_train", "lora_train_early"):
         return handle_lora(inp)
     return {"error": f"unbekannte Aufgabe: {task}"}
 
 
 def streaming_handler(job):
     inp = job.get("input") or {}
-    if inp.get("task") != "lora_train" or FAKE:
+    if inp.get("task") not in ("lora_train", "lora_train_early") or FAKE:
         yield handler(job)
         return
 
