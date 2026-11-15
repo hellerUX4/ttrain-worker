@@ -131,6 +131,74 @@ def image_transform(model, model_name, resolution):
     ])
 
 
+def load_adapter_model(adapter):
+    import torch
+
+    name = adapter.get("model", "dinov2_vits14")
+    model = copy.deepcopy(load_model(name))
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    layers = [getattr(parent, key) for parent, key in adapter_layers(model, name, adapter["blocks"])]
+    with torch.no_grad():
+        for layer, weights in zip(layers, adapter["lora"], strict=True):
+            layer.weight.add_((2 * (weights["B"] @ weights["A"])).to(layer.weight))
+    model.to(device).eval().requires_grad_(False)
+    head = {key: value.to(device) for key, value in adapter["head"].items()}
+    return model, name, device, head
+
+
+def visualize_yes(inp, progress=None):
+    import torch
+    import torch.nn.functional as F
+    from PIL import Image
+
+    if FAKE:
+        raise ValueError("Das Ja-Muster braucht einen echten Worker.")
+    local_head = "linear_head" in inp
+    if local_head:
+        weights = inp["linear_head"]
+        name = "dinov2_vits14"
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        model = copy.deepcopy(load_model(name)).to(device).eval().requires_grad_(False)
+        resolution = 336
+        head = {"weight": torch.tensor([weights["w"]], device=device),
+                "bias": torch.tensor([weights["b"]], device=device)}
+    else:
+        adapter = torch.load(io.BytesIO(base64.b64decode(inp["adapter_b64"], validate=True)),
+                             map_location="cpu", weights_only=True)
+        model, name, device, head = load_adapter_model(adapter)
+        resolution = adapter["resolution"]
+    normalization = image_transform(model, name, resolution).transforms[-1]
+    noise = (0.2 * torch.randn(1, 3, 20, 20, device=device)).requires_grad_()
+    optimizer = torch.optim.Adam([noise], lr=0.08)
+    mean = noise.new_tensor(normalization.mean).view(1, 3, 1, 1)
+    std = noise.new_tensor(normalization.std).view(1, 3, 1, 1)
+    best_logit, best = float("-inf"), None
+    steps = 32
+    for step in range(steps + 1):
+        pixels = F.interpolate(noise.sigmoid(), size=(resolution, resolution),
+                               mode="bilinear", align_corners=False)
+        features = model((pixels - mean) / std)
+        if local_head:
+            features = F.normalize(features)
+        logit = F.linear(features, head["weight"], head["bias"]).squeeze()
+        value = logit.detach().item()
+        if value > best_logit:
+            best_logit, best = value, pixels.detach()
+        if progress and (step % 2 == 0 or step == steps):
+            progress({"step": step, "steps": steps})
+        if step < steps:
+            optimizer.zero_grad()
+            (-logit + 0.01 * noise.square().mean()).backward()
+            optimizer.step()
+    if best is None:
+        raise RuntimeError("Das Modell hat keinen gültigen Ja-Score geliefert.")
+    image = Image.fromarray((best[0].permute(1, 2, 0) * 255).round().byte().cpu().numpy())
+    buf = io.BytesIO()
+    image.save(buf, format="PNG")
+    return {"png": base64.b64encode(buf.getvalue()).decode("ascii"),
+            "score": torch.sigmoid(torch.tensor(best_logit)).item()}
+
+
 def handle_lora_predict(inp):
     images = inp["images"]
     buf = io.BytesIO(base64.b64decode(inp["adapter_b64"], validate=True))
@@ -143,17 +211,9 @@ def handle_lora_predict(inp):
         import torch
 
         adapter = torch.load(buf, map_location="cpu", weights_only=True)
-        model_name = adapter.get("model", "dinov2_vits14")
-        model = copy.deepcopy(load_model(model_name))
-        layers = [getattr(parent, name) for parent, name in adapter_layers(model, model_name, adapter["blocks"])]
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+        model, model_name, device, head = load_adapter_model(adapter)
         tf = image_transform(model, model_name, adapter["resolution"])
         with torch.inference_mode():
-            for layer, weights in zip(layers, adapter["lora"], strict=True):
-                delta = weights["B"] @ weights["A"]
-                layer.weight.add_((delta * 2).to(layer.weight))
-            model.to(device).eval()
-            head = {key: value.to(device) for key, value in adapter["head"].items()}
             x = torch.stack([tf(_decode(i["b64"])) for i in images]).to(device)
             logits = torch.nn.functional.linear(model(x), head["weight"], head["bias"])
             scores = logits.sigmoid().flatten().cpu().tolist()
@@ -360,6 +420,8 @@ def handler(job):
     task = inp.get("task", "embed")
     if task == "embed":
         return handle_embed(inp)
+    if task == "visualize_yes":
+        return visualize_yes(inp)
     if task == "lora_predict":
         return handle_lora_predict(inp)
     if task in ("lora_train", "lora_train_early"):
@@ -369,7 +431,7 @@ def handler(job):
 
 def streaming_handler(job):
     inp = job.get("input") or {}
-    if inp.get("task") not in ("lora_train", "lora_train_early") or FAKE:
+    if inp.get("task") not in ("lora_train", "lora_train_early", "visualize_yes") or FAKE:
         yield handler(job)
         return
 
@@ -380,7 +442,8 @@ def streaming_handler(job):
 
     def train():
         try:
-            result = handle_lora(inp, lambda progress: updates.put(("progress", progress)))
+            function = visualize_yes if inp.get("task") == "visualize_yes" else handle_lora
+            result = function(inp, lambda progress: updates.put(("progress", progress)))
             updates.put(("result", result))
         except Exception as error:
             updates.put(("error", error))
