@@ -268,14 +268,39 @@ def handler(job):
     if task == "lora_predict":
         return handle_lora_predict(inp)
     if task == "lora_train":
-        progress = None
-        if "id" in job and not FAKE:
-            from runpod.serverless import progress_update
-            progress = lambda update: progress_update(job, update)
-        return handle_lora(inp, progress)
+        return handle_lora(inp)
     return {"error": f"unbekannte Aufgabe: {task}"}
+
+
+def streaming_handler(job):
+    inp = job.get("input") or {}
+    if inp.get("task") != "lora_train" or FAKE:
+        yield handler(job)
+        return
+
+    from queue import Queue
+    from threading import Thread
+
+    updates = Queue()
+
+    def train():
+        try:
+            result = handle_lora(inp, lambda progress: updates.put(("progress", progress)))
+            updates.put(("result", result))
+        except Exception as error:
+            updates.put(("error", error))
+
+    Thread(target=train, daemon=True).start()
+    while True:
+        kind, value = updates.get()
+        if kind == "error":
+            raise value
+        if kind == "result":
+            yield value
+            return
+        yield {"training_progress": value}
 
 
 if __name__ == "__main__":
     import runpod
-    runpod.serverless.start({"handler": handler})
+    runpod.serverless.start({"handler": streaming_handler, "return_aggregate_stream": True})
