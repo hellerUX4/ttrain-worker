@@ -23,7 +23,12 @@ import numpy as np
 FAKE = os.environ.get("TTRAIN_FAKE", "0") == "1"
 DIM = 384
 _MODEL = {}
+SWIN_MODELS = {
+    "swinv2_base": "swinv2_base_window12to16_192to256.ms_in22k_ft_in1k",
+    "swinv2_large": "swinv2_large_window12to16_192to256.ms_in22k_ft_in1k",
+}
 TIMM_MODELS = {
+    **SWIN_MODELS,
     "dinov3_vits16": "vit_small_patch16_dinov3.lvd1689m",
     "siglip2_vitb16": "vit_base_patch16_siglip_224.v2_webli",
     "convnextv2_tiny": "convnextv2_tiny.fcmae_ft_in22k_in1k",
@@ -102,9 +107,10 @@ def handle_embed(inp):
 
 
 def adapter_layers(model, model_name, blocks):
-    if model_name == "convnextv2_tiny":
+    if model_name == "convnextv2_tiny" or model_name in SWIN_MODELS:
+        stages = model.layers if model_name in SWIN_MODELS else model.stages
         return [(block.mlp, name)
-                for index, stage in enumerate(model.stages) if index in blocks
+                for index, stage in enumerate(stages) if index in blocks
                 for block in stage.blocks for name in ("fc1", "fc2")]
     if model_name in TIMM_MODELS:
         return [(block.mlp, name)
@@ -311,8 +317,9 @@ def handle_lora(inp, progress=None):
     model = inp.get("model", "dinov2_vits14")
     if model not in (*TIMM_MODELS, "dinov2_vits14", "dinov2_vits14_reg", "dinov2_vitb14", "dinov2_vitl14_reg"):
         raise ValueError("Unbekanntes LoRA-Basismodell.")
-    if model in TIMM_MODELS and res != 224:
-        raise ValueError("Dieses Basismodell erwartet 224 Pixel.")
+    expected_resolution = 256 if model in SWIN_MODELS else 224
+    if model in TIMM_MODELS and res != expected_resolution:
+        raise ValueError(f"Dieses Basismodell erwartet {expected_resolution} Pixel.")
     return train_lora_real(images, blocks, res, epochs, float(inp.get("lr", 1e-4)), progress, model, validation)
 
 
