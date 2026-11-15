@@ -131,12 +131,12 @@ def image_transform(model, model_name, resolution):
     ])
 
 
-def load_adapter_model(adapter):
+def load_adapter_model(adapter, device=None):
     import torch
 
     name = adapter.get("model", "dinov2_vits14")
     model = copy.deepcopy(load_model(name))
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     layers = [getattr(parent, key) for parent, key in adapter_layers(model, name, adapter["blocks"])]
     with torch.no_grad():
         for layer, weights in zip(layers, adapter["lora"], strict=True):
@@ -148,6 +148,21 @@ def load_adapter_model(adapter):
 
 def visualize_yes(inp, progress=None):
     import torch
+
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    try:
+        return optimize_yes_pattern(inp, device, progress)
+    except RuntimeError as error:
+        if device.type != "cuda" or "Expected all tensors to be on the same device" not in str(error):
+            raise
+    if progress:
+        progress({"fallback": "cpu"})
+    device = torch.device("cpu")
+    return optimize_yes_pattern(inp, device, progress)
+
+
+def optimize_yes_pattern(inp, device, progress):
+    import torch
     import torch.nn.functional as F
     from PIL import Image
 
@@ -157,7 +172,6 @@ def visualize_yes(inp, progress=None):
     if local_head:
         weights = inp["linear_head"]
         name = "dinov2_vits14"
-        device = "cuda" if torch.cuda.is_available() else "cpu"
         model = copy.deepcopy(load_model(name)).to(device).eval().requires_grad_(False)
         resolution = 336
         head = {"weight": torch.tensor([weights["w"]], device=device),
@@ -165,7 +179,7 @@ def visualize_yes(inp, progress=None):
     else:
         adapter = torch.load(io.BytesIO(base64.b64decode(inp["adapter_b64"], validate=True)),
                              map_location="cpu", weights_only=True)
-        model, name, device, head = load_adapter_model(adapter)
+        model, name, device, head = load_adapter_model(adapter, device=device)
         resolution = adapter["resolution"]
     normalization = image_transform(model, name, resolution).transforms[-1]
     noise = (0.2 * torch.randn(1, 3, 20, 20, device=device)).requires_grad_()
@@ -177,7 +191,8 @@ def visualize_yes(inp, progress=None):
     for step in range(steps + 1):
         pixels = F.interpolate(noise.sigmoid(), size=(resolution, resolution),
                                mode="bilinear", align_corners=False)
-        features = model((pixels - mean) / std)
+        with device:
+            features = model((pixels - mean) / std)
         if local_head:
             features = F.normalize(features)
         logit = F.linear(features, head["weight"], head["bias"]).squeeze()
