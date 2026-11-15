@@ -129,9 +129,41 @@ def handle_lora_predict(inp):
     return {"scores": {str(item["id"]): score for item, score in zip(images, scores)}}
 
 
+def training_images(inp):
+    url = inp.get("dataset_url")
+    if not url:
+        return inp.get("images") or []
+    import json
+    from urllib.parse import urlsplit
+    from urllib.request import HTTPRedirectHandler, build_opener
+
+    parsed = urlsplit(url)
+    if (parsed.scheme != "https" or not parsed.hostname
+            or not parsed.hostname.endswith(".r2.cloudflarestorage.com")
+            or parsed.netloc != parsed.hostname):
+        raise ValueError("Ungültige Adresse für den privaten Trainingsspeicher.")
+
+    class NoRedirect(HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            return None
+
+    limit = 256 * 1024 * 1024
+    try:
+        with build_opener(NoRedirect()).open(url, timeout=120) as response:
+            data = response.read(limit + 1)
+    except OSError:
+        raise RuntimeError("RunPod konnte die Trainingsbilder nicht aus R2 laden.") from None
+    if len(data) > limit:
+        raise ValueError("Trainingspaket überschreitet 256 MiB.")
+    images = json.loads(data)
+    if not isinstance(images, list) or not images:
+        raise ValueError("Trainingspaket enthält keine Bilder.")
+    return images
+
+
 def handle_lora(inp, progress=None):
     """Trainiert Low-Rank-Adapter auf den letzten Blöcken und liefert sie zurück."""
-    images = inp.get("images") or []
+    images = training_images(inp)
     blocks = inp.get("blocks") or [8, 9, 10, 11]
     res = int(inp.get("resolution", 336))
     epochs = int(inp.get("epochs", 8))
