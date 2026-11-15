@@ -13,6 +13,7 @@ Ohne GPU/Modell lässt sich alles mit TTRAIN_FAKE=1 testen: dann werden
 inhaltliche, aber billige Ersatzvektoren berechnet.
 """
 import base64
+import copy
 import io
 import os
 
@@ -90,6 +91,43 @@ def handle_embed(inp):
     return {"embeddings": embed_real(images, res, inp.get("model", "dinov2_vits14"))}
 
 
+def handle_lora_predict(inp):
+    images = inp["images"]
+    buf = io.BytesIO(base64.b64decode(inp["adapter_b64"], validate=True))
+    if FAKE:
+        with np.load(buf, allow_pickle=False) as adapter:
+            w, b = adapter["w"], float(adapter["b"][0])
+        logits = np.asarray([fake_vector(_decode(i["b64"])) for i in images]) @ w + b
+        scores = (1 / (1 + np.exp(-np.clip(logits, -40, 40)))).tolist()
+    else:
+        import torch
+        from torchvision import transforms
+
+        adapter = torch.load(buf, map_location="cpu", weights_only=True)
+        model = copy.deepcopy(load_model())
+        layers = [getattr(block.attn, name)
+                  for index, block in enumerate(model.blocks) if index in adapter["blocks"]
+                  for name in ("qkv", "proj")]
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        res = adapter["resolution"]
+        tf = transforms.Compose([
+            transforms.Resize(res, interpolation=transforms.InterpolationMode.BICUBIC),
+            transforms.CenterCrop(res),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+        ])
+        with torch.inference_mode():
+            for layer, weights in zip(layers, adapter["lora"], strict=True):
+                delta = weights["B"] @ weights["A"]
+                layer.weight.add_((delta * 2).to(layer.weight))
+            model.to(device).eval()
+            head = {key: value.to(device) for key, value in adapter["head"].items()}
+            x = torch.stack([tf(_decode(i["b64"])) for i in images]).to(device)
+            logits = torch.nn.functional.linear(model(x), head["weight"], head["bias"])
+            scores = logits.sigmoid().flatten().cpu().tolist()
+    return {"scores": {str(item["id"]): score for item, score in zip(images, scores)}}
+
+
 def handle_lora(inp):
     """Trainiert Low-Rank-Adapter auf den letzten Blöcken und liefert sie zurück."""
     images = inp.get("images") or []
@@ -136,7 +174,7 @@ def train_lora_real(images, blocks, res, epochs, lr):
             self.items = items
             self.tf = transforms.Compose([
                 transforms.Resize(res, interpolation=transforms.InterpolationMode.BICUBIC),
-                transforms.RandomCrop(res, scale=(0.7, 1.0)) if hasattr(transforms, "RandomCrop") else transforms.CenterCrop(res),
+                transforms.CenterCrop(res),
                 transforms.ToTensor(),
                 transforms.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
             ])
@@ -160,7 +198,7 @@ def train_lora_real(images, blocks, res, epochs, lr):
         def forward(self, x):
             return self.base(x) + self.scale * (x @ self.A.T @ self.B.T)
 
-    model = load_model()
+    model = copy.deepcopy(load_model())
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model.to(device)
     for p_ in model.parameters():
@@ -208,7 +246,7 @@ def train_lora_real(images, blocks, res, epochs, lr):
                "precision_at_100": round(float(y[order].mean()), 3)}
 
     buf = io.BytesIO()
-    torch.save({"lora": [{k: v.detach().cpu() for k, v in m.state_dict().items()} for m in wrapped],
+    torch.save({"lora": [{k: v.detach().cpu() for k, v in (("A", m.A), ("B", m.B))} for m in wrapped],
                 "head": head.state_dict(), "blocks": list(blocks), "resolution": res}, buf)
     return {"metrics": metrics, "adapter_b64": base64.b64encode(buf.getvalue()).decode(),
             "blocks": list(blocks), "epochs": epochs}
@@ -219,6 +257,8 @@ def handler(job):
     task = inp.get("task", "embed")
     if task == "embed":
         return handle_embed(inp)
+    if task == "lora_predict":
+        return handle_lora_predict(inp)
     if task == "lora_train":
         return handle_lora(inp)
     return {"error": f"unbekannte Aufgabe: {task}"}
