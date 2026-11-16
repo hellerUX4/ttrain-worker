@@ -320,10 +320,14 @@ def handle_lora(inp, progress=None):
     expected_resolution = 256 if model in SWIN_MODELS else 224
     if model in TIMM_MODELS and res != expected_resolution:
         raise ValueError(f"Dieses Basismodell erwartet {expected_resolution} Pixel.")
-    return train_lora_real(images, blocks, res, epochs, float(inp.get("lr", 1e-4)), progress, model, validation)
+    lr = float(inp.get("lr", 1e-4))
+    head_lr = float(inp.get("head_lr", lr))
+    if not all(0 < rate < float("inf") for rate in (lr, head_lr)):
+        raise ValueError("Lernraten müssen endlich und größer als 0 sein.")
+    return train_lora_real(images, blocks, res, epochs, lr, progress, model, validation, head_lr=head_lr)
 
 
-def train_lora_real(images, blocks, res, epochs, lr, progress=None, model_name="dinov2_vits14", validation=()):
+def train_lora_real(images, blocks, res, epochs, lr, progress=None, model_name="dinov2_vits14", validation=(), head_lr=None):
     import torch
     import torch.nn as nn
     from torch.utils.data import DataLoader, Dataset
@@ -369,7 +373,10 @@ def train_lora_real(images, blocks, res, epochs, lr, progress=None, model_name="
     features = model.num_features if model_name in TIMM_MODELS else model.embed_dim
     head = nn.Linear(features, 1).to(device)
     params = [head.weight, head.bias] + [p_ for m in wrapped for p_ in (m.A, m.B)]
-    opt = torch.optim.AdamW(params, lr=lr)
+    groups = [{"params": params[:2], "lr": lr if head_lr is None else head_lr}]
+    if wrapped:
+        groups.append({"params": params[2:], "lr": lr})
+    opt = torch.optim.AdamW(groups, lr=lr)
     loss_fn = nn.BCEWithLogitsLoss()
 
     ds = DS(images)
