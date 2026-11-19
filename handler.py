@@ -353,7 +353,7 @@ def handle_lora_predict(inp):
             "prediction_options": inp.get("prediction_options") or {}}
 
 
-def training_images(inp):
+def training_images(inp, progress=None):
     urls = inp.get("dataset_urls")
     if urls is None:
         url = inp.get("dataset_url")
@@ -363,8 +363,12 @@ def training_images(inp):
     if not isinstance(urls, list) or not urls or any(not isinstance(url, str) for url in urls):
         raise ValueError("Ungültige Liste von Trainingspaketen.")
     images = []
-    for url in urls:
+    for index, url in enumerate(urls):
+        if progress:
+            progress(index, len(urls))
         images.extend(download_training_part(url))
+        if progress:
+            progress(index + 1, len(urls))
     return images
 
 
@@ -399,7 +403,13 @@ def download_training_part(url):
 
 def handle_lora(inp, progress=None):
     """Trainiert Low-Rank-Adapter auf den letzten Blöcken und liefert sie zurück."""
-    images = training_images(inp)
+    def preparing(stage, count=0, total=1):
+        if progress:
+            progress({"stage": stage, "epoch": 1, "epochs": int(inp.get("epochs", 8)),
+                      "processed": count, "images": total})
+    preparing("download")
+    images = training_images(inp, lambda count, total: preparing("download", count, total))
+    preparing("setup")
     blocks = inp.get("blocks", [8, 9, 10, 11])
     res = int(inp.get("resolution", 336))
     epochs = int(inp.get("epochs", 8))
@@ -455,7 +465,11 @@ def train_lora_real(images, blocks, res, epochs, lr, progress=None, model_name="
     import torch
     import torch.nn as nn
     from torch.utils.data import DataLoader, Dataset
+    if progress:
+        progress({"stage": "model_load", "epoch": 1, "epochs": epochs, "processed": 0, "images": 1})
     model = copy.deepcopy(load_model(model_name))
+    if progress:
+        progress({"stage": "setup", "epoch": 1, "epochs": epochs, "processed": 0, "images": 1})
     options = training_options or {}
     tf = configured_transform(model, model_name, res, options)
     train_tf = configured_transform(model, model_name, res, options, training=True)
@@ -520,10 +534,19 @@ def train_lora_real(images, blocks, res, epochs, lr, progress=None, model_name="
     validation_loader = DataLoader(DS(validation), batch_size=batch_size) if validation else None
     best_loss, best_epoch, best_params = float("inf"), 0, None
     last_update = float("-inf")
+    def report_stage(stage, count, total, force=False):
+        nonlocal last_update
+        now = time.monotonic()
+        if progress and (force or count == total or now - last_update >= 2):
+            progress({"stage": stage, "epoch": epoch, "epochs": epochs,
+                      "processed": count, "images": total})
+            last_update = now
+
     for epoch in range(1, epochs + 1):
         model.train()
         head.train()
         processed = 0
+        report_stage("train", 0, len(ds), force=True)
         for x, y in dl:
             x, y = x.to(device), y.float().to(device)
             opt.zero_grad()
@@ -541,21 +564,27 @@ def train_lora_real(images, blocks, res, epochs, lr, progress=None, model_name="
             model.eval()
             head.eval()
             weights = []
+            report_stage("hard_negative", 0, len(eval_ds), force=True)
             with torch.no_grad():
                 for x, y in DataLoader(eval_ds, batch_size=batch_size):
                     scores = head(feature_tensor(model, x.to(device))).sigmoid().squeeze(1).cpu()
                     difficult = (y == 0) & (scores >= options.get("hard_threshold", 0.5))
                     weights.extend(torch.where(difficult, hard_factor, 1).tolist())
+                    report_stage("hard_negative", len(weights), len(eval_ds))
             sampler.weights = torch.as_tensor(weights, dtype=torch.double)
 
         if validation_loader is not None:
             model.eval()
             head.eval()
             total_loss = 0.0
+            checked = 0
+            report_stage("validation", 0, len(validation), force=True)
             with torch.no_grad():
                 for x, y in validation_loader:
                     logits = head(feature_tensor(model, x.to(device))).squeeze(1)
                     total_loss += loss_fn(logits, y.to(device)).item() * len(y)
+                    checked += len(y)
+                    report_stage("validation", checked, len(validation))
             validation_loss = total_loss / len(validation)
             if not np.isfinite(validation_loss):
                 raise RuntimeError("Der Validierungsverlust ist ungültig.")
@@ -565,17 +594,22 @@ def train_lora_real(images, blocks, res, epochs, lr, progress=None, model_name="
             if epoch - best_epoch >= 3:
                 break
 
+    report_stage("checkpoint", 0, 1, force=True)
     if best_params is not None:
         with torch.no_grad():
             for param, best in zip(params, best_params):
                 param.copy_(best)
     model.eval()
+    report_stage("training_evaluation", 0, len(eval_ds), force=True)
     with torch.no_grad():
         scores, labels = [], []
+        checked = 0
         for x, y in DataLoader(eval_ds, batch_size=batch_size):
             x = x.to(device)
             scores.append(torch.sigmoid(head(feature_tensor(model, x)).squeeze(1)).cpu().numpy())
             labels.append(y.numpy())
+            checked += len(y)
+            report_stage("training_evaluation", checked, len(eval_ds))
     p = np.concatenate(scores); y = np.concatenate(labels)
     pred = p >= 0.5
     tp = float((pred & (y == 1)).sum()); fp = float((pred & (y == 0)).sum()); fn = float(((~pred) & (y == 1)).sum())
@@ -584,9 +618,12 @@ def train_lora_real(images, blocks, res, epochs, lr, progress=None, model_name="
                "precision_at_100": round(float(y[order].mean()), 3)}
 
     buf = io.BytesIO()
+    report_stage("saving", 0, 1, force=True)
     torch.save({"lora": [{k: v.detach().cpu() for k, v in (("A", m.A), ("B", m.B))} for m in wrapped],
                 "head": head.state_dict(), "blocks": list(blocks), "resolution": res, "model": model_name, "training_options": options}, buf)
-    return {"metrics": metrics, "adapter_b64": base64.b64encode(buf.getvalue()).decode(),
+    encoded = base64.b64encode(buf.getvalue()).decode()
+    report_stage("saving", 1, 1, force=True)
+    return {"metrics": metrics, "adapter_b64": encoded,
             "blocks": list(blocks), "epochs": epoch, "best_epoch": best_epoch or epoch,
             "early_stopping": validation_loader is not None, "model": model_name, "training_options": options}
 
@@ -611,7 +648,7 @@ def streaming_handler(job):
         yield handler(job)
         return
 
-    from queue import Queue
+    from queue import Queue, Empty
     from threading import Thread
 
     updates = Queue()
@@ -625,17 +662,23 @@ def streaming_handler(job):
             updates.put(("error", error))
 
     Thread(target=train, daemon=True).start()
+    latest = None
     while True:
-        kind, value = updates.get()
+        try:
+            kind, value = updates.get(timeout=10)
+        except Empty:
+            if latest is not None:
+                yield {"training_progress": {**latest, "heartbeat": True}}
+            continue
         if kind == "error":
             raise value
         if kind == "result":
             yield value
             return
+        latest = value
         yield {"training_progress": value}
 
 
 if __name__ == "__main__":
     import runpod
     runpod.serverless.start({"handler": streaming_handler, "return_aggregate_stream": True})
-
