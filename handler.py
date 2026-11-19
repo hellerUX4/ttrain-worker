@@ -241,7 +241,9 @@ def configured_transform(model, model_name, resolution, options=None, training=F
     if options.get("crop", "center") == "pad":
         steps.append(transforms.Lambda(lambda image: ImageOps.pad(
             image, (resolution, resolution), method=3, color=(124, 116, 104))))
-    steps.extend(base.transforms)
+    spatial = (transforms.Resize, transforms.CenterCrop)
+    steps.extend(step for step in base.transforms
+                 if options.get("crop") != "pad" or not isinstance(step, spatial))
     return transforms.Compose(steps)
 
 
