@@ -40,10 +40,13 @@ def _pil():
     return Image
 
 
-def _decode(b64):
+def _decode(b64, processing_version=1):
     from PIL import Image
     raw = base64.b64decode(b64)
-    img = Image.open(io.BytesIO(raw)).convert("RGB")
+    from PIL import ImageOps
+    with Image.open(io.BytesIO(raw)) as source:
+        oriented = ImageOps.exif_transpose(source) if processing_version >= 2 else source
+        img = oriented.convert("RGB")
     return img
 
 
@@ -75,35 +78,33 @@ def load_model(name="dinov2_vits14"):
     return model
 
 
-def embed_real(images, resolution=336, model_name="dinov2_vits14"):
+def embed_real(images, resolution=336, model_name="dinov2_vits14", processing_version=1):
     import torch
     from torchvision import transforms
     model = load_model(model_name)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model.to(device)
-    tf = transforms.Compose([
-        transforms.Resize(resolution, interpolation=transforms.InterpolationMode.BICUBIC),
-        transforms.CenterCrop(resolution),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
-    ])
+    tf = configured_transform(model, model_name, resolution,
+                              {"crop": "pad", "processing_version": 2} if processing_version >= 2 else {})
     out = []
     with torch.no_grad():
         for item in images:
-            img = _decode(item["b64"])
+            img = _decode(item["b64"], processing_version)
             x = tf(img).unsqueeze(0).to(device)
             v = model(x)[0].float().cpu().numpy()
             v = v / (np.linalg.norm(v) + 1e-8)
-            out.append({"id": str(item["id"]), "vector": v.tolist()})
+            out.append({"id": str(item["id"]), "vector": v.tolist(), "signature": item.get("signature")})
     return out
 
 
 def handle_embed(inp):
-    images = inp.get("images") or []
+    images = training_images(inp)
     res = int(inp.get("resolution", 336))
     if FAKE:
         return {"embeddings": [{"id": str(i["id"]), "vector": fake_vector(_decode(i["b64"]), res)} for i in images]}
-    return {"embeddings": embed_real(images, res, inp.get("model", "dinov2_vits14"))}
+    return {"embeddings": embed_real(images, res, inp.get("model", "dinov2_vits14"), inp.get("processing_version", 1)),
+            "processing_version": inp.get("processing_version", 1), "resolution": res,
+            "model": inp.get("model", "dinov2_vits14")}
 
 
 def adapter_layers(model, model_name, blocks):
@@ -174,6 +175,7 @@ def optimize_yes_pattern(inp, device, progress):
 
     if FAKE:
         raise ValueError("Das Ja-Muster braucht einen echten Worker.")
+    pattern_options = {}
     local_head = "linear_head" in inp
     if local_head:
         weights = inp["linear_head"]
@@ -187,6 +189,7 @@ def optimize_yes_pattern(inp, device, progress):
                              map_location="cpu", weights_only=True)
         model, name, device, head = load_adapter_model(adapter, device=device)
         resolution = adapter["resolution"]
+        pattern_options = adapter.get("training_options") or {}
     normalization = image_transform(model, name, resolution).transforms[-1]
     noise = (0.2 * torch.randn(1, 3, 20, 20, device=device)).requires_grad_()
     optimizer = torch.optim.Adam([noise], lr=0.08)
@@ -198,7 +201,22 @@ def optimize_yes_pattern(inp, device, progress):
         pixels = F.interpolate(noise.sigmoid(), size=(resolution, resolution),
                                mode="bilinear", align_corners=False)
         with device:
-            features = model((pixels - mean) / std)
+            normalized = (pixels - mean) / std
+        if pattern_options.get("detail_grid"):
+            tensors = [normalized]
+            grid = pattern_options["detail_grid"]
+            overlap = pattern_options.get("detail_overlap", .2)
+            size = 1 / (grid - (grid - 1) * overlap)
+            for row in range(grid):
+                for col in range(grid):
+                    left = round(col * size * (1-overlap) * resolution)
+                    top = round(row * size * (1-overlap) * resolution)
+                    tile = normalized[:, :, top:min(resolution, round(top+size*resolution)),
+                                      left:min(resolution, round(left+size*resolution))]
+                    tensors.append(F.interpolate(tile, size=(resolution,resolution),
+                                                 mode="bicubic", align_corners=False))
+            normalized = torch.stack(tensors, dim=1)
+        features = feature_tensor(model, normalized)
         if local_head:
             features = F.normalize(features)
         logit = F.linear(features, head["weight"], head["bias"]).squeeze()
@@ -247,7 +265,48 @@ def configured_transform(model, model_name, resolution, options=None, training=F
     return transforms.Compose(steps)
 
 
-def view_scores(model, head, images, transform, full_transform, options, device):
+def detail_images(image, options):
+    grid = options.get("detail_grid", 0)
+    if not grid:
+        return [image]
+    overlap = options.get("detail_overlap", 0.2)
+    size = 1 / (grid - (grid-1)*overlap)
+    stride = size * (1-overlap)
+    tiles = [image]
+    for row in range(grid):
+        for col in range(grid):
+            left, top = col*stride, row*stride
+            tiles.append(image.crop((round(left*image.width), round(top*image.height),
+                                     min(image.width, round((left+size)*image.width)),
+                                     min(image.height, round((top+size)*image.height)))))
+    return tiles
+
+
+def feature_tensor(model, x):
+    import torch
+    if x.ndim == 4:
+        return model(x)
+    batch, views = x.shape[:2]
+    chunks = []
+    for chunk in x.flatten(0, 1).split(1 if model.training else 2):
+        if model.training:
+            from torch.utils.checkpoint import checkpoint
+            chunks.append(checkpoint(model, chunk, use_reentrant=False))
+        else:
+            chunks.append(model(chunk))
+    features = torch.cat(chunks).reshape(batch, views, -1)
+    return torch.cat((features[:, 0], features[:, 1:].mean(1),
+                                   features[:, 1:].max(1).values), dim=1)
+
+
+def transformed_views(image, transform, options):
+    import torch
+    views = detail_images(image, options)
+    tensors = [transform(view) for view in views]
+    return torch.stack(tensors) if len(tensors) > 1 else tensors[0]
+
+
+def view_scores(model, head, images, transform, full_transform, options, device, training_options=None):
     import torch
     from PIL import ImageOps
     views = [images]
@@ -262,15 +321,15 @@ def view_scores(model, head, images, transform, full_transform, options, device)
     scores = []
     for index, view in enumerate(views):
         tf = full_transform if index and options["views"][index-1] == "full" else transform
-        x = torch.stack([tf(image) for image in view]).to(device)
-        scores.append(torch.nn.functional.linear(model(x), head["weight"], head["bias"]).sigmoid().flatten())
+        x = torch.stack([transformed_views(image, tf, training_options or {}) for image in view]).to(device)
+        scores.append(torch.nn.functional.linear(feature_tensor(model, x), head["weight"], head["bias"]).sigmoid().flatten())
     stacked = torch.stack(scores)
     method = options.get("aggregation", "mean")
     return (stacked.min(0).values if method == "min" else stacked.mean(0)).cpu().tolist()
 
 
 def handle_lora_predict(inp):
-    images = inp["images"]
+    images = training_images(inp)
     buf = io.BytesIO(base64.b64decode(inp["adapter_b64"], validate=True))
     if FAKE:
         with np.load(buf, allow_pickle=False) as adapter:
@@ -285,8 +344,11 @@ def handle_lora_predict(inp):
         tf = configured_transform(model, model_name, adapter["resolution"], adapter.get("training_options"))
         full = configured_transform(model, model_name, adapter["resolution"], {"crop": "pad"})
         with torch.inference_mode():
-            scores = view_scores(model, head, [_decode(i["b64"]) for i in images], tf, full,
-                                 inp.get("prediction_options") or {}, device)
+            scores = []
+            for item in images:
+                image = _decode(item["b64"], adapter.get("training_options", {}).get("processing_version", 1))
+                scores.extend(view_scores(model, head, [image], tf, full,
+                              inp.get("prediction_options") or {}, device, adapter.get("training_options") or {}))
     return {"scores": {str(item["id"]): score for item, score in zip(images, scores)},
             "prediction_options": inp.get("prediction_options") or {}}
 
@@ -408,7 +470,7 @@ def train_lora_real(images, blocks, res, epochs, lr, progress=None, model_name="
 
         def __getitem__(self, i):
             it = self.items[i]
-            return self.tf(_decode(it["b64"])), torch.tensor(float(it.get("y", 0)))
+            return transformed_views(_decode(it["b64"], options.get("processing_version", 1)), self.tf, options), torch.tensor(float(it.get("y", 0)))
 
     class LoRA(nn.Module):
         def __init__(self, base: nn.Linear, r=8, alpha=16):
@@ -435,7 +497,7 @@ def train_lora_real(images, blocks, res, epochs, lr, progress=None, model_name="
         wrapped.append(lora)
 
     features = model.num_features if model_name in TIMM_MODELS else model.embed_dim
-    head = nn.Linear(features, 1).to(device)
+    head = nn.Linear(features * (3 if options.get("detail_grid") else 1), 1).to(device)
     params = [head.weight, head.bias] + [p_ for m in wrapped for p_ in (m.A, m.B)]
     groups = [{"params": params[:2], "lr": lr if head_lr is None else head_lr}]
     if wrapped:
@@ -453,8 +515,9 @@ def train_lora_real(images, blocks, res, epochs, lr, progress=None, model_name="
     if hard_factor > 1:
         from torch.utils.data import WeightedRandomSampler
         sampler = WeightedRandomSampler(torch.ones(len(ds), dtype=torch.double), len(ds), replacement=True)
-    dl = DataLoader(ds, batch_size=8, shuffle=sampler is None, sampler=sampler)
-    validation_loader = DataLoader(DS(validation), batch_size=8) if validation else None
+    batch_size = 1 if options.get("detail_grid") else 8
+    dl = DataLoader(ds, batch_size=batch_size, shuffle=sampler is None, sampler=sampler)
+    validation_loader = DataLoader(DS(validation), batch_size=batch_size) if validation else None
     best_loss, best_epoch, best_params = float("inf"), 0, None
     last_update = float("-inf")
     for epoch in range(1, epochs + 1):
@@ -464,7 +527,7 @@ def train_lora_real(images, blocks, res, epochs, lr, progress=None, model_name="
         for x, y in dl:
             x, y = x.to(device), y.float().to(device)
             opt.zero_grad()
-            feat = model(x)
+            feat = feature_tensor(model, x)
             loss = loss_fn(head(feat).squeeze(1), y)
             loss.backward()
             opt.step()
@@ -479,8 +542,8 @@ def train_lora_real(images, blocks, res, epochs, lr, progress=None, model_name="
             head.eval()
             weights = []
             with torch.no_grad():
-                for x, y in DataLoader(eval_ds, batch_size=8):
-                    scores = head(model(x.to(device))).sigmoid().squeeze(1).cpu()
+                for x, y in DataLoader(eval_ds, batch_size=batch_size):
+                    scores = head(feature_tensor(model, x.to(device))).sigmoid().squeeze(1).cpu()
                     difficult = (y == 0) & (scores >= options.get("hard_threshold", 0.5))
                     weights.extend(torch.where(difficult, hard_factor, 1).tolist())
             sampler.weights = torch.as_tensor(weights, dtype=torch.double)
@@ -491,7 +554,7 @@ def train_lora_real(images, blocks, res, epochs, lr, progress=None, model_name="
             total_loss = 0.0
             with torch.no_grad():
                 for x, y in validation_loader:
-                    logits = head(model(x.to(device))).squeeze(1)
+                    logits = head(feature_tensor(model, x.to(device))).squeeze(1)
                     total_loss += loss_fn(logits, y.to(device)).item() * len(y)
             validation_loss = total_loss / len(validation)
             if not np.isfinite(validation_loss):
@@ -509,9 +572,9 @@ def train_lora_real(images, blocks, res, epochs, lr, progress=None, model_name="
     model.eval()
     with torch.no_grad():
         scores, labels = [], []
-        for x, y in DataLoader(eval_ds, batch_size=8):
+        for x, y in DataLoader(eval_ds, batch_size=batch_size):
             x = x.to(device)
-            scores.append(torch.sigmoid(head(model(x)).squeeze(1)).cpu().numpy())
+            scores.append(torch.sigmoid(head(feature_tensor(model, x)).squeeze(1)).cpu().numpy())
             labels.append(y.numpy())
     p = np.concatenate(scores); y = np.concatenate(labels)
     pred = p >= 0.5
