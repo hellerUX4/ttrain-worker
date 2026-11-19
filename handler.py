@@ -242,9 +242,21 @@ def handle_lora_predict(inp):
 
 
 def training_images(inp):
-    url = inp.get("dataset_url")
-    if not url:
-        return inp.get("images") or []
+    urls = inp.get("dataset_urls")
+    if urls is None:
+        url = inp.get("dataset_url")
+        if not url:
+            return inp.get("images") or []
+        urls = [url]
+    if not isinstance(urls, list) or not urls or any(not isinstance(url, str) for url in urls):
+        raise ValueError("Ungültige Liste von Trainingspaketen.")
+    images = []
+    for url in urls:
+        images.extend(download_training_part(url))
+    return images
+
+
+def download_training_part(url):
     import json
     from urllib.parse import urlsplit
     from urllib.request import HTTPRedirectHandler, build_opener
