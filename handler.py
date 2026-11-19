@@ -409,7 +409,6 @@ def handle_lora(inp, progress=None):
                       "processed": count, "images": total})
     preparing("download")
     images = training_images(inp, lambda count, total: preparing("download", count, total))
-    preparing("setup")
     blocks = inp.get("blocks", [8, 9, 10, 11])
     res = int(inp.get("resolution", 336))
     epochs = int(inp.get("epochs", 8))
