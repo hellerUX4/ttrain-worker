@@ -220,6 +220,53 @@ def optimize_yes_pattern(inp, device, progress):
             "score": torch.sigmoid(torch.tensor(best_logit)).item()}
 
 
+def configured_transform(model, model_name, resolution, options=None, training=False):
+    from torchvision import transforms
+    from PIL import ImageOps
+    options = options or {}
+    base = image_transform(model, model_name, resolution)
+    steps = []
+    if training:
+        if options.get("flip", False):
+            steps.append(transforms.RandomHorizontalFlip())
+        brightness = options.get("brightness", 0)
+        saturation = options.get("saturation", 0)
+        if brightness or saturation:
+            steps.append(transforms.ColorJitter(brightness=brightness, saturation=saturation))
+        scale = options.get("crop_scale", 1)
+        if scale < 1:
+            steps.append(transforms.RandomResizedCrop(
+                resolution, scale=(scale, 1), ratio=(0.95, 1.05),
+                interpolation=transforms.InterpolationMode.BICUBIC))
+    if options.get("crop", "center") == "pad":
+        steps.append(transforms.Lambda(lambda image: ImageOps.pad(
+            image, (resolution, resolution), method=3, color=(124, 116, 104))))
+    steps.extend(base.transforms)
+    return transforms.Compose(steps)
+
+
+def view_scores(model, head, images, transform, full_transform, options, device):
+    import torch
+    from PIL import ImageOps
+    views = [images]
+    for name in options.get("views", []):
+        if name == "mirror":
+            views.append([ImageOps.mirror(image) for image in images])
+        elif name == "detail":
+            views.append([image.crop((int(image.width*.075), int(image.height*.075),
+                                     int(image.width*.925), int(image.height*.925))) for image in images])
+        elif name == "full":
+            views.append(images)
+    scores = []
+    for index, view in enumerate(views):
+        tf = full_transform if index and options["views"][index-1] == "full" else transform
+        x = torch.stack([tf(image) for image in view]).to(device)
+        scores.append(torch.nn.functional.linear(model(x), head["weight"], head["bias"]).sigmoid().flatten())
+    stacked = torch.stack(scores)
+    method = options.get("aggregation", "mean")
+    return (stacked.min(0).values if method == "min" else stacked.mean(0)).cpu().tolist()
+
+
 def handle_lora_predict(inp):
     images = inp["images"]
     buf = io.BytesIO(base64.b64decode(inp["adapter_b64"], validate=True))
@@ -233,12 +280,13 @@ def handle_lora_predict(inp):
 
         adapter = torch.load(buf, map_location="cpu", weights_only=True)
         model, model_name, device, head = load_adapter_model(adapter)
-        tf = image_transform(model, model_name, adapter["resolution"])
+        tf = configured_transform(model, model_name, adapter["resolution"], adapter.get("training_options"))
+        full = configured_transform(model, model_name, adapter["resolution"], {"crop": "pad"})
         with torch.inference_mode():
-            x = torch.stack([tf(_decode(i["b64"])) for i in images]).to(device)
-            logits = torch.nn.functional.linear(model(x), head["weight"], head["bias"])
-            scores = logits.sigmoid().flatten().cpu().tolist()
-    return {"scores": {str(item["id"]): score for item, score in zip(images, scores)}}
+            scores = view_scores(model, head, [_decode(i["b64"]) for i in images], tf, full,
+                                 inp.get("prediction_options") or {}, device)
+    return {"scores": {str(item["id"]): score for item, score in zip(images, scores)},
+            "prediction_options": inp.get("prediction_options") or {}}
 
 
 def training_images(inp):
@@ -336,20 +384,22 @@ def handle_lora(inp, progress=None):
     head_lr = float(inp.get("head_lr", lr))
     if not all(0 < rate < float("inf") for rate in (lr, head_lr)):
         raise ValueError("Lernraten müssen endlich und größer als 0 sein.")
-    return train_lora_real(images, blocks, res, epochs, lr, progress, model, validation, head_lr=head_lr)
+    return train_lora_real(images, blocks, res, epochs, lr, progress, model, validation, head_lr=head_lr, training_options=inp.get("training_options"))
 
 
-def train_lora_real(images, blocks, res, epochs, lr, progress=None, model_name="dinov2_vits14", validation=(), head_lr=None):
+def train_lora_real(images, blocks, res, epochs, lr, progress=None, model_name="dinov2_vits14", validation=(), head_lr=None, training_options=None):
     import torch
     import torch.nn as nn
     from torch.utils.data import DataLoader, Dataset
     model = copy.deepcopy(load_model(model_name))
-    tf = image_transform(model, model_name, res)
+    options = training_options or {}
+    tf = configured_transform(model, model_name, res, options)
+    train_tf = configured_transform(model, model_name, res, options, training=True)
 
     class DS(Dataset):
-        def __init__(self, items):
+        def __init__(self, items, transform=tf):
             self.items = items
-            self.tf = tf
+            self.tf = transform
 
         def __len__(self):
             return len(self.items)
@@ -389,10 +439,19 @@ def train_lora_real(images, blocks, res, epochs, lr, progress=None, model_name="
     if wrapped:
         groups.append({"params": params[2:], "lr": lr})
     opt = torch.optim.AdamW(groups, lr=lr)
-    loss_fn = nn.BCEWithLogitsLoss()
+    def loss_fn(logits, labels):
+        losses = nn.functional.binary_cross_entropy_with_logits(logits, labels, reduction="none")
+        weights = torch.where(labels == 0, options.get("negative_weight", 1), 1)
+        return (losses * weights).mean()
 
-    ds = DS(images)
-    dl = DataLoader(ds, batch_size=8, shuffle=True)
+    ds = DS(images, train_tf)
+    eval_ds = DS(images)
+    hard_factor = options.get("hard_factor", 1)
+    sampler = None
+    if hard_factor > 1:
+        from torch.utils.data import WeightedRandomSampler
+        sampler = WeightedRandomSampler(torch.ones(len(ds), dtype=torch.double), len(ds), replacement=True)
+    dl = DataLoader(ds, batch_size=8, shuffle=sampler is None, sampler=sampler)
     validation_loader = DataLoader(DS(validation), batch_size=8) if validation else None
     best_loss, best_epoch, best_params = float("inf"), 0, None
     last_update = float("-inf")
@@ -412,6 +471,17 @@ def train_lora_real(images, blocks, res, epochs, lr, progress=None, model_name="
             if progress and (now - last_update >= 2 or processed == len(ds)):
                 progress({"epoch": epoch, "epochs": epochs, "processed": processed, "images": len(ds)})
                 last_update = now
+
+        if sampler is not None and epoch < epochs:
+            model.eval()
+            head.eval()
+            weights = []
+            with torch.no_grad():
+                for x, y in DataLoader(eval_ds, batch_size=8):
+                    scores = head(model(x.to(device))).sigmoid().squeeze(1).cpu()
+                    difficult = (y == 0) & (scores >= options.get("hard_threshold", 0.5))
+                    weights.extend(torch.where(difficult, hard_factor, 1).tolist())
+            sampler.weights = torch.as_tensor(weights, dtype=torch.double)
 
         if validation_loader is not None:
             model.eval()
@@ -437,7 +507,7 @@ def train_lora_real(images, blocks, res, epochs, lr, progress=None, model_name="
     model.eval()
     with torch.no_grad():
         scores, labels = [], []
-        for x, y in DataLoader(ds, batch_size=8):
+        for x, y in DataLoader(eval_ds, batch_size=8):
             x = x.to(device)
             scores.append(torch.sigmoid(head(model(x)).squeeze(1)).cpu().numpy())
             labels.append(y.numpy())
@@ -450,10 +520,10 @@ def train_lora_real(images, blocks, res, epochs, lr, progress=None, model_name="
 
     buf = io.BytesIO()
     torch.save({"lora": [{k: v.detach().cpu() for k, v in (("A", m.A), ("B", m.B))} for m in wrapped],
-                "head": head.state_dict(), "blocks": list(blocks), "resolution": res, "model": model_name}, buf)
+                "head": head.state_dict(), "blocks": list(blocks), "resolution": res, "model": model_name, "training_options": options}, buf)
     return {"metrics": metrics, "adapter_b64": base64.b64encode(buf.getvalue()).decode(),
             "blocks": list(blocks), "epochs": epoch, "best_epoch": best_epoch or epoch,
-            "early_stopping": validation_loader is not None, "model": model_name}
+            "early_stopping": validation_loader is not None, "model": model_name, "training_options": options}
 
 
 def handler(job):
@@ -503,3 +573,4 @@ def streaming_handler(job):
 if __name__ == "__main__":
     import runpod
     runpod.serverless.start({"handler": streaming_handler, "return_aggregate_stream": True})
+
