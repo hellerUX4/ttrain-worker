@@ -303,6 +303,76 @@ def feature_tensor(model, x):
                                    features[:, 1:].max(1).values), dim=1)
 
 
+def load_sam3(device):
+    from huggingface_hub import hf_hub_download
+    from transformers import Sam3Model, Sam3Processor
+
+    model_id = "facebook/sam3"
+    hf_hub_download(model_id, "config.json")
+    processor = Sam3Processor.from_pretrained(model_id)
+    model = Sam3Model.from_pretrained(model_id).to(device).eval()
+    return model, processor, device
+
+
+def segment_sam3_image(image, runtime, prompt="person"):
+    model, processor, device = runtime
+    inputs = processor(images=image, text=prompt, return_tensors="pt").to(device)
+    size = image.copy()
+    size.thumbnail((512, 512))
+    return processor.post_process_instance_segmentation(
+        model(**inputs), threshold=.5, mask_threshold=.5,
+        target_sizes=[(size.height, size.width)],
+    )[0]
+
+
+def encode_png(image):
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG")
+    return base64.b64encode(buffer.getvalue()).decode("ascii")
+
+
+def encode_masks(masks):
+    from PIL import Image, ImageChops
+
+    PALETTE = ((27, 206, 235), (255, 164, 66), (137, 225, 107), (211, 135, 248))
+
+    overlay = None
+    foreground = None
+    count = 0
+    for mask in masks:
+        alpha = Image.fromarray(mask.cpu().numpy().astype("uint8") * 255)
+        if alpha.getbbox() is None:
+            continue
+        color = PALETTE[count % len(PALETTE)]
+        count += 1
+        foreground = alpha if foreground is None else ImageChops.lighter(foreground, alpha)
+        layer = Image.new("RGBA", alpha.size, color)
+        layer.putalpha(alpha.point([0] * 255 + [120]))
+        overlay = layer if overlay is None else Image.alpha_composite(overlay, layer)
+    if foreground is None:
+        return {"person_count": 0, "mask_png": None, "foreground_png": None}
+    matte = Image.new("RGBA", foreground.size)
+    matte.putalpha(foreground)
+    return {"person_count": count, "mask_png": encode_png(overlay), "foreground_png": encode_png(matte)}
+
+
+def sam3_group_box(image, masks):
+    if not len(masks):
+        return None
+    foreground = masks.bool().any(dim=0).cpu().numpy()
+    ys, xs = np.nonzero(foreground)
+    if not len(xs):
+        return None
+    mask_height, mask_width = foreground.shape
+    width, height = image.size
+    box = (int(xs.min()) * width // mask_width, int(ys.min()) * height // mask_height,
+           ((int(xs.max()) + 1) * width + mask_width - 1) // mask_width,
+           ((int(ys.max()) + 1) * height + mask_height - 1) // mask_height)
+    if box[2] - box[0] < 16 or box[3] - box[1] < 16:
+        return None
+    return box
+
+
 def yolo_person_masks(image, model, device, *, confidence=.25, iou=None, resolution=640):
     resized = image.copy()
     max_edge = max(768, resolution)
@@ -500,7 +570,7 @@ def handle_lora(inp, progress=None):
     res = int(inp.get("resolution", 336))
     epochs = int(inp.get("epochs", 8))
 
-    early = inp.get("task") in ("lora_train_early", "lora_train_early_sampled", "lora_train_early_sam2", "lora_train_early_yolo")
+    early = inp.get("task") in ("lora_train_early", "lora_train_early_sampled", "lora_train_early_sam2", "lora_train_early_yolo", "lora_train_early_sam3")
     validation = [item for item in images if item.get("validation")] if early else []
     if early:
         images = [item for item in images if not item.get("validation")]
@@ -544,10 +614,11 @@ def handle_lora(inp, progress=None):
     head_lr = float(inp.get("head_lr", lr))
     if not all(0 < rate < float("inf") for rate in (lr, head_lr)):
         raise ValueError("Lernraten müssen endlich und größer als 0 sein.")
-    return train_lora_real(images, blocks, res, epochs, lr, progress, model, validation, head_lr=head_lr, training_options=inp.get("training_options"))
+    return train_lora_real(images, blocks, res, epochs, lr, progress, model, validation, head_lr=head_lr, training_options=inp.get("training_options"),
+                           sam3_result_url=inp.get("sam3_result_url"))
 
 
-def train_lora_real(images, blocks, res, epochs, lr, progress=None, model_name="dinov2_vits14", validation=(), head_lr=None, training_options=None):
+def train_lora_real(images, blocks, res, epochs, lr, progress=None, model_name="dinov2_vits14", validation=(), head_lr=None, training_options=None, sam3_result_url=None):
     import torch
     import torch.nn as nn
     from random import random
@@ -561,6 +632,12 @@ def train_lora_real(images, blocks, res, epochs, lr, progress=None, model_name="
     tf = configured_transform(model, model_name, res, options)
     train_tf = configured_transform(model, model_name, res, options, training=True)
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    sam3_probability = options.get("sam3_probability", 0)
+    sam3_boxes = {}
+    sam3_results = {}
+    sam3 = None
+    if sam3_probability:
+        sam3_tf = configured_transform(model, model_name, res, {**options, "crop": "pad", "crop_scale": 1}, training=True)
     yolo_probability = options.get("yolo_cutout_probability", 0)
     yolo_masks = {}
     yolo = None
@@ -585,11 +662,30 @@ def train_lora_real(images, blocks, res, epochs, lr, progress=None, model_name="
             return len(self.items)
 
         def __getitem__(self, i):
+            nonlocal sam3
             it = self.items[i]
             probability = options.get("detail_probability", 100) if self.training else 100
             include_details = probability == 100 or random() < probability / 100
             image = _decode(it["b64"], options.get("processing_version", 1))
             transform = self.tf
+            if self.training and sam3_probability and random() < sam3_probability / 100:
+                if "sam3_crop_box" in it:
+                    box = it["sam3_crop_box"]
+                else:
+                    if i not in sam3_boxes:
+                        with torch.inference_mode():
+                            if sam3 is None:
+                                sam3 = load_sam3(device)
+                            masks = segment_sam3_image(image, sam3)["masks"]
+                            sam3_boxes[i] = sam3_group_box(image, masks)
+                            if sam3_result_url:
+                                sam3_results[str(it["id"])] = {**encode_masks(masks), "crop_box": sam3_boxes[i]}
+                    box = sam3_boxes[i]
+                if box is not None:
+                    left, top, right, bottom = box
+                    if 0 <= left < right <= image.width and 0 <= top < bottom <= image.height:
+                        image = image.crop(box)
+                        transform = sam3_tf
             if self.training and yolo is not None and random() < yolo_probability / 100:
                 if i not in yolo_masks:
                     with torch.inference_mode():
@@ -744,20 +840,44 @@ def train_lora_real(images, blocks, res, epochs, lr, progress=None, model_name="
                 "head": head.state_dict(), "blocks": list(blocks), "resolution": res, "model": model_name, "training_options": options}, buf)
     encoded = base64.b64encode(buf.getvalue()).decode()
     report_stage("saving", 1, 1, force=True)
+    if sam3_result_url and sam3_results:
+        import gzip
+        import json
+        from urllib.request import Request, urlopen
+
+        body = gzip.compress(json.dumps(sam3_results, separators=(",", ":")).encode("utf-8"), compresslevel=4)
+        try:
+            with urlopen(Request(sam3_result_url, body, method="PUT"), timeout=180) as response:
+                if response.status != 200:
+                    raise RuntimeError("SAM-3-Masken konnten nicht gespeichert werden.")
+        except OSError:
+            raise RuntimeError("SAM-3-Masken konnten nicht in R2 gespeichert werden.") from None
     return {"metrics": metrics, "adapter_b64": encoded,
             "blocks": list(blocks), "epochs": epoch, "best_epoch": best_epoch or epoch,
-            "early_stopping": validation_loader is not None, "model": model_name, "training_options": options}
+            "early_stopping": validation_loader is not None, "model": model_name, "training_options": options,
+            **({"sam3_masks_uploaded": True} if sam3_result_url and sam3_results else {}),
+            **({"sam3_crops": {str(images[i]["id"]): box for i, box in sam3_boxes.items()}} if sam3_boxes else {})}
 
 
 TRAIN_TASKS = ("lora_train", "lora_train_early", "lora_train_sampled", "lora_train_early_sampled",
-               "lora_train_sam2", "lora_train_early_sam2", "lora_train_yolo", "lora_train_early_yolo")
+               "lora_train_sam2", "lora_train_early_sam2", "lora_train_yolo", "lora_train_early_yolo",
+               "lora_train_sam3", "lora_train_early_sam3")
 
 
 def handler(job):
     inp = job.get("input") or {}
     task = inp.get("task", "embed")
     if task == "capabilities":
-        return {"training_tasks": list(TRAIN_TASKS), "processing_version": 2}
+        result = {"training_tasks": list(TRAIN_TASKS), "processing_version": 2}
+        if inp.get("check_sam3_access"):
+            from huggingface_hub import hf_hub_download
+
+            try:
+                hf_hub_download("facebook/sam3", "config.json")
+                result["sam3_access"] = True
+            except Exception:
+                result["sam3_access"] = False
+        return result
     if task == "embed":
         return handle_embed(inp)
     if task == "visualize_yes":
