@@ -175,6 +175,11 @@ def optimize_yes_pattern(inp, device, progress):
 
     if FAKE:
         raise ValueError("Das Ja-Muster braucht einen echten Worker.")
+    steps, grid_size = inp.get("steps", 32), inp.get("grid", 20)
+    if type(steps) is not int or steps not in (32, 64, 128, 256, 512):
+        raise ValueError("Ungültige Schrittzahl für das Ja-Muster.")
+    if type(grid_size) is not int or grid_size not in (20, 40, 64):
+        raise ValueError("Ungültige Rastergröße für das Ja-Muster.")
     pattern_options = {}
     local_head = "linear_head" in inp
     if local_head:
@@ -191,12 +196,11 @@ def optimize_yes_pattern(inp, device, progress):
         resolution = adapter["resolution"]
         pattern_options = adapter.get("training_options") or {}
     normalization = image_transform(model, name, resolution).transforms[-1]
-    noise = (0.2 * torch.randn(1, 3, 20, 20, device=device)).requires_grad_()
+    noise = (0.2 * torch.randn(1, 3, grid_size, grid_size, device=device)).requires_grad_()
     optimizer = torch.optim.Adam([noise], lr=0.08)
     mean = noise.new_tensor(normalization.mean).view(1, 3, 1, 1)
     std = noise.new_tensor(normalization.std).view(1, 3, 1, 1)
     best_logit, best = float("-inf"), None
-    steps = 32
     for step in range(steps + 1):
         pixels = F.interpolate(noise.sigmoid(), size=(resolution, resolution),
                                mode="bilinear", align_corners=False)
@@ -235,7 +239,7 @@ def optimize_yes_pattern(inp, device, progress):
     buf = io.BytesIO()
     image.save(buf, format="PNG")
     return {"png": base64.b64encode(buf.getvalue()).decode("ascii"),
-            "score": torch.sigmoid(torch.tensor(best_logit)).item()}
+            "score": torch.sigmoid(torch.tensor(best_logit)).item(), "steps": steps, "grid": grid_size}
 
 
 def configured_transform(model, model_name, resolution, options=None, training=False):
@@ -868,7 +872,7 @@ def handler(job):
     inp = job.get("input") or {}
     task = inp.get("task", "embed")
     if task == "capabilities":
-        result = {"training_tasks": list(TRAIN_TASKS), "processing_version": 2}
+        result = {"training_tasks": list(TRAIN_TASKS), "processing_version": 2, "pattern_options": True}
         if inp.get("check_sam3_access"):
             from huggingface_hub import hf_hub_download
 
@@ -880,7 +884,7 @@ def handler(job):
         return result
     if task == "embed":
         return handle_embed(inp)
-    if task == "visualize_yes":
+    if task in ("visualize_yes", "visualize_yes_configured"):
         return visualize_yes(inp)
     if task == "lora_predict":
         return handle_lora_predict(inp)
@@ -891,7 +895,7 @@ def handler(job):
 
 def streaming_handler(job):
     inp = job.get("input") or {}
-    if inp.get("task") not in (*TRAIN_TASKS, "visualize_yes") or FAKE:
+    if inp.get("task") not in (*TRAIN_TASKS, "visualize_yes", "visualize_yes_configured") or FAKE:
         yield handler(job)
         return
 
@@ -902,7 +906,7 @@ def streaming_handler(job):
 
     def train():
         try:
-            function = visualize_yes if inp.get("task") == "visualize_yes" else handle_lora
+            function = visualize_yes if inp.get("task") in ("visualize_yes", "visualize_yes_configured") else handle_lora
             result = function(inp, lambda progress: updates.put(("progress", progress)))
             updates.put(("result", result))
         except Exception as error:
