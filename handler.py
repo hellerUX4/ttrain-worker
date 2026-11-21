@@ -295,15 +295,102 @@ def feature_tensor(model, x):
         else:
             chunks.append(model(chunk))
     features = torch.cat(chunks).reshape(batch, views, -1)
+    if views == 1:
+        # Keep the classifier input layout while omitting both detail features.
+        full = features[:, 0]
+        return torch.cat((full, full.new_zeros((batch, 2 * full.shape[1]))), dim=1)
     return torch.cat((features[:, 0], features[:, 1:].mean(1),
                                    features[:, 1:].max(1).values), dim=1)
 
 
-def transformed_views(image, transform, options):
+def yolo_person_masks(image, model, device, *, confidence=.25, iou=None, resolution=640):
+    resized = image.copy()
+    max_edge = max(768, resolution)
+    resized.thumbnail((max_edge, max_edge))
+    overlap = {} if iou is None else {"iou": iou}
+    result = model.predict(resized, classes=[0], conf=confidence, imgsz=resolution, retina_masks=True,
+                           device=device, verbose=False, **overlap)[0]
+    if result.masks is None:
+        return [], []
+    return result.masks.data.cpu(), result.boxes.conf.cpu().tolist()
+
+
+def yolo_mask_quality(masks, scores):
+    if not len(masks):
+        return "Keine Personenmaske gefunden."
+    if len(scores) != len(masks) or any(not np.isfinite(score) or score < .60 for score in scores):
+        return "Mindestens eine Person wurde zu unsicher erkannt."
+    if (masks.float().mean(dim=(1, 2)) < .003).any():
+        return "Mindestens eine Personenmaske ist sehr klein."
+    area = masks.bool().any(dim=0).float().mean().item()
+    if not .05 <= area <= .90:
+        return "Die gemeinsame Maske bedeckt weniger als 5 % oder mehr als 90 % des Bildes."
+    return None
+
+
+def yolo_training_mask(image, model, device):
+    from PIL import Image
+
+    masks, scores = yolo_person_masks(image, model, device)
+    if yolo_mask_quality(masks, scores):
+        return None
+    alpha = Image.fromarray(masks.bool().any(dim=0).numpy().astype("uint8") * 255)
+    buffer = io.BytesIO()
+    alpha.save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
+def apply_yolo_training_mask(image, mask):
+    from PIL import Image
+
+    if mask is None:
+        return image
+    with Image.open(io.BytesIO(mask)) as alpha:
+        background = Image.new("RGB", image.size, (124, 116, 104))
+        return Image.composite(image, background, alpha.resize(image.size, Image.Resampling.NEAREST))
+
+
+def load_sam2_predictor(device):
+    from sam2.sam2_image_predictor import SAM2ImagePredictor
+
+    return SAM2ImagePredictor.from_pretrained("facebook/sam2.1-hiera-tiny", device=device)
+
+
+def sam2_crop_candidate(image, predictor):
+    width, height = image.size
+    predictor.set_image(np.array(image))
+    masks, scores, _ = predictor.predict(
+        point_coords=np.array([[width // 2, height // 2]], dtype=np.float32),
+        point_labels=np.array([1], dtype=np.int32),
+        multimask_output=True,
+    )
+    fallback_mask = None
+    for index in np.argsort(np.where(np.isfinite(scores), scores, -np.inf))[::-1]:
+        mask = masks[index]
+        if fallback_mask is None and np.isfinite(scores[index]) and mask.any():
+            fallback_mask = mask
+        if not np.isfinite(scores[index]) or scores[index] < .75:
+            continue
+        if not mask[height // 2, width // 2] or not .03 <= mask.mean() <= .8:
+            continue
+        ys, xs = np.nonzero(mask)
+        left, right = int(xs.min()), int(xs.max()) + 1
+        top, bottom = int(ys.min()), int(ys.max()) + 1
+        margin_x = round((right - left) * .1)
+        margin_y = round((bottom - top) * .1)
+        box = (max(0, left - margin_x), max(0, top - margin_y),
+               min(width, right + margin_x), min(height, bottom + margin_y))
+        if (box[2] - box[0]) >= 16 and (box[3] - box[1]) >= 16 and box != (0, 0, width, height):
+            return box, mask
+    return None, fallback_mask
+
+
+def transformed_views(image, transform, options, *, include_details=True):
     import torch
-    views = detail_images(image, options)
-    tensors = [transform(view) for view in views]
-    return torch.stack(tensors) if len(tensors) > 1 else tensors[0]
+    if not options.get("detail_grid"):
+        return transform(image)
+    views = detail_images(image, options) if include_details else [image]
+    return torch.stack([transform(view) for view in views])
 
 
 def view_scores(model, head, images, transform, full_transform, options, device, training_options=None):
@@ -413,7 +500,7 @@ def handle_lora(inp, progress=None):
     res = int(inp.get("resolution", 336))
     epochs = int(inp.get("epochs", 8))
 
-    early = inp.get("task") == "lora_train_early"
+    early = inp.get("task") in ("lora_train_early", "lora_train_early_sampled", "lora_train_early_sam2", "lora_train_early_yolo")
     validation = [item for item in images if item.get("validation")] if early else []
     if early:
         images = [item for item in images if not item.get("validation")]
@@ -463,6 +550,7 @@ def handle_lora(inp, progress=None):
 def train_lora_real(images, blocks, res, epochs, lr, progress=None, model_name="dinov2_vits14", validation=(), head_lr=None, training_options=None):
     import torch
     import torch.nn as nn
+    from random import random
     from torch.utils.data import DataLoader, Dataset
     if progress:
         progress({"stage": "model_load", "epoch": 1, "epochs": epochs, "processed": 0, "images": 1})
@@ -472,18 +560,53 @@ def train_lora_real(images, blocks, res, epochs, lr, progress=None, model_name="
     options = training_options or {}
     tf = configured_transform(model, model_name, res, options)
     train_tf = configured_transform(model, model_name, res, options, training=True)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    yolo_probability = options.get("yolo_cutout_probability", 0)
+    yolo_masks = {}
+    yolo = None
+    if yolo_probability:
+        from ultralytics import YOLO
+
+        yolo = YOLO("yolo11s-seg.pt")
+        yolo_tf = configured_transform(model, model_name, res, {**options, "crop": "pad", "crop_scale": 1}, training=True)
+    sam2_probability = options.get("sam2_probability", 0)
+    sam2_boxes = {}
+    predictor = None
+    if sam2_probability:
+        predictor = load_sam2_predictor(device)
 
     class DS(Dataset):
-        def __init__(self, items, transform=tf):
+        def __init__(self, items, *, training=False):
             self.items = items
-            self.tf = transform
+            self.training = training
+            self.tf = train_tf if training else tf
 
         def __len__(self):
             return len(self.items)
 
         def __getitem__(self, i):
             it = self.items[i]
-            return transformed_views(_decode(it["b64"], options.get("processing_version", 1)), self.tf, options), torch.tensor(float(it.get("y", 0)))
+            probability = options.get("detail_probability", 100) if self.training else 100
+            include_details = probability == 100 or random() < probability / 100
+            image = _decode(it["b64"], options.get("processing_version", 1))
+            transform = self.tf
+            if self.training and yolo is not None and random() < yolo_probability / 100:
+                if i not in yolo_masks:
+                    with torch.inference_mode():
+                        yolo_masks[i] = yolo_training_mask(image, yolo, device)
+                if yolo_masks[i] is not None:
+                    image = apply_yolo_training_mask(image, yolo_masks[i])
+                    transform = yolo_tf
+            if self.training and predictor is not None and random() < sam2_probability / 100:
+                if i not in sam2_boxes:
+                    with torch.inference_mode():
+                        sam2_boxes[i], _ = sam2_crop_candidate(image, predictor)
+                    predictor.reset_predictor()
+                box = sam2_boxes[i]
+                if box is not None:
+                    image = image.crop(box)
+            views = transformed_views(image, transform, options, include_details=include_details)
+            return views, torch.tensor(float(it.get("y", 0)))
 
     class LoRA(nn.Module):
         def __init__(self, base: nn.Linear, r=8, alpha=16):
@@ -497,7 +620,6 @@ def train_lora_real(images, blocks, res, epochs, lr, progress=None, model_name="
         def forward(self, x):
             return self.base(x) + self.scale * (x @ self.A.T @ self.B.T)
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
     model.to(device)
     for p_ in model.parameters():
         p_.requires_grad_(False)
@@ -521,7 +643,7 @@ def train_lora_real(images, blocks, res, epochs, lr, progress=None, model_name="
         weights = torch.where(labels == 0, options.get("negative_weight", 1), 1)
         return (losses * weights).mean()
 
-    ds = DS(images, train_tf)
+    ds = DS(images, training=True)
     eval_ds = DS(images)
     hard_factor = options.get("hard_factor", 1)
     sampler = None
@@ -627,23 +749,29 @@ def train_lora_real(images, blocks, res, epochs, lr, progress=None, model_name="
             "early_stopping": validation_loader is not None, "model": model_name, "training_options": options}
 
 
+TRAIN_TASKS = ("lora_train", "lora_train_early", "lora_train_sampled", "lora_train_early_sampled",
+               "lora_train_sam2", "lora_train_early_sam2", "lora_train_yolo", "lora_train_early_yolo")
+
+
 def handler(job):
     inp = job.get("input") or {}
     task = inp.get("task", "embed")
+    if task == "capabilities":
+        return {"training_tasks": list(TRAIN_TASKS), "processing_version": 2}
     if task == "embed":
         return handle_embed(inp)
     if task == "visualize_yes":
         return visualize_yes(inp)
     if task == "lora_predict":
         return handle_lora_predict(inp)
-    if task in ("lora_train", "lora_train_early"):
+    if task in TRAIN_TASKS:
         return handle_lora(inp)
     return {"error": f"unbekannte Aufgabe: {task}"}
 
 
 def streaming_handler(job):
     inp = job.get("input") or {}
-    if inp.get("task") not in ("lora_train", "lora_train_early", "visualize_yes") or FAKE:
+    if inp.get("task") not in (*TRAIN_TASKS, "visualize_yes") or FAKE:
         yield handler(job)
         return
 
