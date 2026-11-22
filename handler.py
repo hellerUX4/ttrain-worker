@@ -227,14 +227,14 @@ def yes_pattern_scorer(inp, device):
         resolution = adapter["resolution"]
         pattern_options = adapter.get("training_options") or {}
     normalization = image_transform(model, name, resolution).transforms[-1]
-    mean = head["weight"].new_tensor(normalization.mean).view(1, 3, 1, 1)
-    std = head["weight"].new_tensor(normalization.std).view(1, 3, 1, 1)
+    mean = torch.as_tensor(normalization.mean, device=device, dtype=torch.float32).view(1, 3, 1, 1)
+    std = torch.as_tensor(normalization.std, device=device, dtype=torch.float32).view(1, 3, 1, 1)
 
     def score(pixels):
+        pixels = pixels.to(device=device, dtype=torch.float32)
         pixels = F.interpolate(pixels, size=(resolution, resolution), mode="bilinear",
                                align_corners=False, antialias=True) if pixels.shape[-1] != resolution else pixels
-        with device:
-            normalized = (pixels - mean) / std
+        normalized = (pixels - mean.to(pixels)) / std.to(pixels)
         if pattern_options.get("detail_grid"):
             tensors = [normalized]
             grid = pattern_options["detail_grid"]
