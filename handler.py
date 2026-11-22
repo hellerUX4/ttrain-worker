@@ -1,4 +1,3 @@
-import secrets
 # -*- coding: utf-8 -*-
 """RunPod-Handler für TTrain.
 
@@ -152,171 +151,6 @@ def load_adapter_model(adapter, device=None):
     model.to(device).eval().requires_grad_(False)
     head = {key: value.to(device) for key, value in adapter["head"].items()}
     return model, name, device, head
-
-
-def visualize_yes(inp, progress=None):
-    import torch
-
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    try:
-        return optimize_yes_pattern(inp, device, progress)
-    except RuntimeError as error:
-        if device.type != "cuda" or "Expected all tensors to be on the same device" not in str(error):
-            raise
-    if progress:
-        progress({"fallback": "cpu"})
-    device = torch.device("cpu")
-    return optimize_yes_pattern(inp, device, progress)
-
-
-def optimize_yes_pattern(inp, device, progress):
-    import torch
-    import torch.nn.functional as F
-    from PIL import Image
-
-    if FAKE:
-        raise ValueError("Das Ja-Muster braucht einen echten Worker.")
-    steps, grid_size = inp.get("steps", 32), inp.get("grid", 20)
-    if type(steps) is not int or steps not in (32, 64, 128, 256, 512):
-        raise ValueError("Ungültige Schrittzahl für das Ja-Muster.")
-    if type(grid_size) is not int or grid_size not in (20, 40, 64):
-        raise ValueError("Ungültige Rastergröße für das Ja-Muster.")
-    score, resolution = yes_pattern_scorer(inp, device)
-    noise = (0.2 * torch.randn(1, 3, grid_size, grid_size, device=device)).requires_grad_()
-    optimizer = torch.optim.Adam([noise], lr=0.08)
-    best_logit, best = float("-inf"), None
-    for step in range(steps + 1):
-        pixels = F.interpolate(noise.sigmoid(), size=(resolution, resolution),
-                               mode="bilinear", align_corners=False)
-        logit = score(pixels)
-        value = logit.detach().item()
-        if value > best_logit:
-            best_logit, best = value, pixels.detach()
-        if progress and (step % 2 == 0 or step == steps):
-            progress({"step": step, "steps": steps})
-        if step < steps:
-            optimizer.zero_grad()
-            (-logit + 0.01 * noise.square().mean()).backward()
-            optimizer.step()
-    if best is None:
-        raise RuntimeError("Das Modell hat keinen gültigen Ja-Score geliefert.")
-    image = Image.fromarray((best[0].permute(1, 2, 0) * 255).round().byte().cpu().numpy())
-    buf = io.BytesIO()
-    image.save(buf, format="PNG")
-    return {"png": base64.b64encode(buf.getvalue()).decode("ascii"),
-            "score": torch.sigmoid(torch.tensor(best_logit)).item(), "steps": steps, "grid": grid_size}
-
-
-def yes_pattern_scorer(inp, device):
-    import torch
-    import torch.nn.functional as F
-
-    pattern_options = {}
-    local_head = "linear_head" in inp
-    if local_head:
-        weights = inp["linear_head"]
-        name = "dinov2_vits14"
-        model = copy.deepcopy(load_model(name)).to(device).eval().requires_grad_(False)
-        resolution = 336
-        head = {"weight": torch.tensor([weights["w"]], dtype=torch.float32, device=device),
-                "bias": torch.tensor([weights["b"]], dtype=torch.float32, device=device)}
-    else:
-        adapter = torch.load(io.BytesIO(base64.b64decode(inp["adapter_b64"], validate=True)),
-                             map_location="cpu", weights_only=True)
-        model, name, device, head = load_adapter_model(adapter, device=device)
-        resolution = adapter["resolution"]
-        pattern_options = adapter.get("training_options") or {}
-    normalization = image_transform(model, name, resolution).transforms[-1]
-    mean = torch.as_tensor(normalization.mean, device=device, dtype=torch.float32).view(1, 3, 1, 1)
-    std = torch.as_tensor(normalization.std, device=device, dtype=torch.float32).view(1, 3, 1, 1)
-
-    def score(pixels):
-        pixels = pixels.to(device=device, dtype=torch.float32)
-        pixels = F.interpolate(pixels, size=(resolution, resolution), mode="bilinear",
-                               align_corners=False, antialias=True) if pixels.shape[-1] != resolution else pixels
-        normalized = (pixels - mean.to(pixels)) / std.to(pixels)
-        if pattern_options.get("detail_grid"):
-            tensors = [normalized]
-            grid = pattern_options["detail_grid"]
-            overlap = pattern_options.get("detail_overlap", .2)
-            size = 1 / (grid - (grid - 1) * overlap)
-            for row in range(grid):
-                for col in range(grid):
-                    left = round(col * size * (1-overlap) * resolution)
-                    top = round(row * size * (1-overlap) * resolution)
-                    tile = normalized[:, :, top:min(resolution, round(top+size*resolution)),
-                                      left:min(resolution, round(left+size*resolution))]
-                    tensors.append(F.interpolate(tile, size=(resolution,resolution),
-                                                 mode="bicubic", align_corners=False))
-            normalized = torch.stack(tensors, dim=1)
-        features = feature_tensor(model, normalized)
-        if local_head:
-            features = F.normalize(features)
-        return F.linear(features, head["weight"], head["bias"]).squeeze()
-
-    return score, resolution
-
-
-def visualize_yes_diffusion(inp, progress=None):
-    import torch
-    from diffusers import DDIMScheduler, StableDiffusionPipeline
-    from PIL import Image
-
-    if FAKE or not torch.cuda.is_available():
-        raise RuntimeError("Das fotorealistische Ja-Muster braucht einen GPU-Worker.")
-    device = torch.device("cuda:0")
-    score, _ = yes_pattern_scorer(inp, device)
-    pipe = StableDiffusionPipeline.from_pretrained(
-        "stable-diffusion-v1-5/stable-diffusion-v1-5",
-        variant="fp16", torch_dtype=torch.float16, use_safetensors=True, token=False,
-        safety_checker=None, requires_safety_checker=False,
-    ).to(device)
-    pipe.vae.eval().requires_grad_(False)
-    pipe.unet.eval().requires_grad_(False)
-    pipe.enable_vae_slicing()
-    scheduler = DDIMScheduler.from_config(pipe.scheduler.config, clip_sample=False)
-    count, steps = 3, 24
-    scheduler.set_timesteps(steps, device=device)
-    with torch.no_grad():
-        embedding, _ = pipe.encode_prompt("", device, 1, False)
-    images = []
-    for sample in range(count):
-        seed = secrets.randbits(32)
-        rng = torch.Generator(device=device).manual_seed(seed)
-        latent = torch.randn((1, pipe.unet.config.in_channels, 64, 64),
-                             generator=rng, device=device, dtype=torch.float32)
-        for index, timestep in enumerate(scheduler.timesteps):
-            with torch.no_grad():
-                noise = pipe.unet(latent.to(pipe.unet.dtype), timestep,
-                                  encoder_hidden_states=embedding).sample.float()
-            # Guide intermediate predictions of the clean image without retaining the U-Net graph.
-            if 3 <= index < steps - 2:
-                with torch.enable_grad():
-                    clean = scheduler.step(noise, timestep, latent).pred_original_sample
-                    clean = clean.detach().requires_grad_()
-                    decoded = pipe.vae.decode((clean / pipe.vae.config.scaling_factor).to(pipe.vae.dtype)).sample
-                    logit = score((decoded.float() / 2 + .5).clamp(0, 1))
-                    gradient, = torch.autograd.grad(logit, clean)
-                rms = gradient.square().mean().sqrt()
-                if torch.isfinite(rms) and rms > 0:
-                    noise = noise - 0.12 * (gradient / rms).clamp(-4, 4)
-            latent = scheduler.step(noise, timestep, latent).prev_sample
-            if progress:
-                progress({"step": sample * steps + index + 1, "steps": count * steps})
-        with torch.no_grad():
-            decoded = pipe.vae.decode((latent / pipe.vae.config.scaling_factor).to(pipe.vae.dtype)).sample
-            pixels = (decoded.float() / 2 + .5).clamp(0, 1)
-            array = (pixels[0].permute(1, 2, 0) * 255).round().byte().cpu().numpy()
-            image = Image.fromarray(array)
-        buf = io.BytesIO()
-        image.save(buf, format="JPEG", quality=90)
-        with torch.no_grad():
-            import numpy as np
-            shown = torch.from_numpy(np.array(Image.open(buf))).to(device).permute(2, 0, 1)[None].float() / 255
-            score_value = score(shown).sigmoid().item()
-        images.append({"jpg": base64.b64encode(buf.getvalue()).decode("ascii"),
-                       "score": score_value, "seed": seed})
-    return {"images": images, "steps": steps}
 
 
 def configured_transform(model, model_name, resolution, options=None, training=False):
@@ -949,8 +783,7 @@ def handler(job):
     inp = job.get("input") or {}
     task = inp.get("task", "embed")
     if task == "capabilities":
-        result = {"training_tasks": list(TRAIN_TASKS), "processing_version": 2, "pattern_options": True, "pattern_diffusion": True,
-                  "pattern_diffusion_safety_checker": False}
+        result = {"training_tasks": list(TRAIN_TASKS), "processing_version": 2}
         if inp.get("check_sam3_access"):
             from huggingface_hub import hf_hub_download
 
@@ -962,10 +795,6 @@ def handler(job):
         return result
     if task == "embed":
         return handle_embed(inp)
-    if task == "visualize_yes_diffusion":
-        return visualize_yes_diffusion(inp)
-    if task in ("visualize_yes", "visualize_yes_configured"):
-        return visualize_yes(inp)
     if task == "lora_predict":
         return handle_lora_predict(inp)
     if task in TRAIN_TASKS:
@@ -975,7 +804,7 @@ def handler(job):
 
 def streaming_handler(job):
     inp = job.get("input") or {}
-    if inp.get("task") not in (*TRAIN_TASKS, "visualize_yes", "visualize_yes_configured", "visualize_yes_diffusion") or FAKE:
+    if inp.get("task") not in TRAIN_TASKS or FAKE:
         yield handler(job)
         return
 
@@ -986,13 +815,7 @@ def streaming_handler(job):
 
     def train():
         try:
-            if inp.get("task") == "visualize_yes_diffusion":
-                function = visualize_yes_diffusion
-            elif inp.get("task") in ("visualize_yes", "visualize_yes_configured"):
-                function = visualize_yes
-            else:
-                function = handle_lora
-            result = function(inp, lambda progress: updates.put(("progress", progress)))
+            result = handle_lora(inp, lambda progress: updates.put(("progress", progress)))
             updates.put(("result", result))
         except Exception as error:
             updates.put(("error", error))
