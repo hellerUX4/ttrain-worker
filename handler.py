@@ -218,8 +218,8 @@ def yes_pattern_scorer(inp, device):
         name = "dinov2_vits14"
         model = copy.deepcopy(load_model(name)).to(device).eval().requires_grad_(False)
         resolution = 336
-        head = {"weight": torch.tensor([weights["w"]], device=device),
-                "bias": torch.tensor([weights["b"]], device=device)}
+        head = {"weight": torch.tensor([weights["w"]], dtype=torch.float32, device=device),
+                "bias": torch.tensor([weights["b"]], dtype=torch.float32, device=device)}
     else:
         adapter = torch.load(io.BytesIO(base64.b64decode(inp["adapter_b64"], validate=True)),
                              map_location="cpu", weights_only=True)
