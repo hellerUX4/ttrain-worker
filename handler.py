@@ -269,6 +269,7 @@ def visualize_yes_diffusion(inp, progress=None):
     pipe = StableDiffusionPipeline.from_pretrained(
         "stable-diffusion-v1-5/stable-diffusion-v1-5",
         variant="fp16", torch_dtype=torch.float16, use_safetensors=True, token=False,
+        safety_checker=None, requires_safety_checker=False,
     ).to(device)
     pipe.vae.eval().requires_grad_(False)
     pipe.unet.eval().requires_grad_(False)
@@ -307,9 +308,6 @@ def visualize_yes_diffusion(inp, progress=None):
             pixels = (decoded.float() / 2 + .5).clamp(0, 1)
             array = (pixels[0].permute(1, 2, 0) * 255).round().byte().cpu().numpy()
             image = Image.fromarray(array)
-            _, filtered = pipe.run_safety_checker(decoded, device, pipe.vae.dtype)
-            if filtered and filtered[0]:
-                continue
         buf = io.BytesIO()
         image.save(buf, format="JPEG", quality=90)
         with torch.no_grad():
@@ -318,7 +316,7 @@ def visualize_yes_diffusion(inp, progress=None):
             score_value = score(shown).sigmoid().item()
         images.append({"jpg": base64.b64encode(buf.getvalue()).decode("ascii"),
                        "score": score_value, "seed": seed})
-    return {"images": images, "steps": steps, "filtered": count - len(images)}
+    return {"images": images, "steps": steps}
 
 
 def configured_transform(model, model_name, resolution, options=None, training=False):
@@ -951,7 +949,8 @@ def handler(job):
     inp = job.get("input") or {}
     task = inp.get("task", "embed")
     if task == "capabilities":
-        result = {"training_tasks": list(TRAIN_TASKS), "processing_version": 2, "pattern_options": True, "pattern_diffusion": True}
+        result = {"training_tasks": list(TRAIN_TASKS), "processing_version": 2, "pattern_options": True, "pattern_diffusion": True,
+                  "pattern_diffusion_safety_checker": False}
         if inp.get("check_sam3_access"):
             from huggingface_hub import hf_hub_download
 
