@@ -14,6 +14,7 @@ inhaltliche, aber billige Ersatzvektoren berechnet.
 """
 import base64
 import copy
+import hashlib
 import io
 import os
 import time
@@ -23,6 +24,7 @@ import numpy as np
 FAKE = os.environ.get("TTRAIN_FAKE", "0") == "1"
 DIM = 384
 _MODEL = {}
+_PREDICT_MODEL = None
 SWIN_MODELS = {
     "swinv2_base": "swinv2_base_window12to16_192to256.ms_in22k_ft_in1k",
     "swinv2_large": "swinv2_large_window12to16_192to256.ms_in22k_ft_in1k",
@@ -98,6 +100,8 @@ def embed_real(images, resolution=336, model_name="dinov2_vits14", processing_ve
 
 
 def handle_embed(inp):
+    global _PREDICT_MODEL
+    _PREDICT_MODEL = None
     images = training_images(inp)
     res = int(inp.get("resolution", 336))
     if FAKE:
@@ -400,10 +404,29 @@ def view_scores(model, head, images, transform, full_transform, options, device,
     return (stacked.min(0).values if method == "min" else stacked.mean(0)).cpu().tolist()
 
 
+def prediction_model(encoded):
+    import torch
+
+    global _PREDICT_MODEL
+    key = hashlib.sha256(encoded.encode("ascii")).digest()
+    if _PREDICT_MODEL is None or _PREDICT_MODEL[0] != key:
+        _PREDICT_MODEL = None
+        buf = io.BytesIO(base64.b64decode(encoded, validate=True))
+        adapter = torch.load(buf, map_location="cpu", weights_only=True)
+        model, name, device, head = load_adapter_model(adapter)
+        options = adapter.get("training_options") or {}
+        transform = configured_transform(model, name, adapter["resolution"], options)
+        full = configured_transform(model, name, adapter["resolution"], {"crop": "pad"})
+        _PREDICT_MODEL = (key, model, device, head, transform, full, options)
+    return _PREDICT_MODEL
+
+
 def handle_lora_predict(inp):
     images = training_images(inp)
-    buf = io.BytesIO(base64.b64decode(inp["adapter_b64"], validate=True))
+    encoded = inp["adapter_b64"]
+    options = inp.get("prediction_options") or {}
     if FAKE:
+        buf = io.BytesIO(base64.b64decode(encoded, validate=True))
         with np.load(buf, allow_pickle=False) as adapter:
             w, b = adapter["w"], float(adapter["b"][0])
         logits = np.asarray([fake_vector(_decode(i["b64"])) for i in images]) @ w + b
@@ -411,18 +434,28 @@ def handle_lora_predict(inp):
     else:
         import torch
 
-        adapter = torch.load(buf, map_location="cpu", weights_only=True)
-        model, model_name, device, head = load_adapter_model(adapter)
-        tf = configured_transform(model, model_name, adapter["resolution"], adapter.get("training_options"))
-        full = configured_transform(model, model_name, adapter["resolution"], {"crop": "pad"})
+        _, model, device, head, tf, full, training_options = prediction_model(encoded)
+        processing = training_options.get("processing_version", 1)
+        # Detail mode already batches the flattened views in feature_tensor.
+        batch_size = 2 if training_options.get("detail_grid") else 4
+        start = 0
+        scores = []
         with torch.inference_mode():
-            scores = []
-            for item in images:
-                image = _decode(item["b64"], adapter.get("training_options", {}).get("processing_version", 1))
-                scores.extend(view_scores(model, head, [image], tf, full,
-                              inp.get("prediction_options") or {}, device, adapter.get("training_options") or {}))
+            while start < len(images):
+                batch = [_decode(item["b64"], processing) for item in images[start:start + batch_size]]
+                try:
+                    result = view_scores(model, head, batch, tf, full, options, device, training_options)
+                except torch.cuda.OutOfMemoryError:
+                    if batch_size == 1:
+                        raise
+                    batch_size //= 2
+                else:
+                    scores.extend(result)
+                    start += len(batch)
+                    continue
+                torch.cuda.empty_cache()
     return {"scores": {str(item["id"]): score for item, score in zip(images, scores)},
-            "prediction_options": inp.get("prediction_options") or {}}
+            "prediction_options": options}
 
 
 def training_images(inp, progress=None):
@@ -475,6 +508,9 @@ def download_training_part(url):
 
 def handle_lora(inp, progress=None):
     """Trainiert Low-Rank-Adapter auf den letzten Blöcken und liefert sie zurück."""
+    global _PREDICT_MODEL
+    _PREDICT_MODEL = None
+
     def preparing(stage, count=0, total=1):
         if progress:
             progress({"stage": stage, "epoch": 1, "epochs": int(inp.get("epochs", 8)),
