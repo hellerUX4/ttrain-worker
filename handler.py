@@ -436,24 +436,11 @@ def handle_lora_predict(inp):
 
         _, model, device, head, tf, full, training_options = prediction_model(encoded)
         processing = training_options.get("processing_version", 1)
-        # Detail mode already batches the flattened views in feature_tensor.
-        batch_size = 2 if training_options.get("detail_grid") else 4
-        start = 0
         scores = []
         with torch.inference_mode():
-            while start < len(images):
-                batch = [_decode(item["b64"], processing) for item in images[start:start + batch_size]]
-                try:
-                    result = view_scores(model, head, batch, tf, full, options, device, training_options)
-                except torch.cuda.OutOfMemoryError:
-                    if batch_size == 1:
-                        raise
-                    batch_size //= 2
-                else:
-                    scores.extend(result)
-                    start += len(batch)
-                    continue
-                torch.cuda.empty_cache()
+            for item in images:
+                image = _decode(item["b64"], processing)
+                scores.extend(view_scores(model, head, [image], tf, full, options, device, training_options))
     return {"scores": {str(item["id"]): score for item, score in zip(images, scores)},
             "prediction_options": options}
 
